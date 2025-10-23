@@ -15,8 +15,9 @@ class Settings:
     openai_api_key: str
     model: str = "gpt-4o-mini"
     transcription_model: str = "whisper-1"
+    embedding_model: str = "text-embedding-3-small"
     sample_rate: int = 16000
-    chunk_duration: float = 5.0
+    chunk_duration: float = 1.5
 
     @classmethod
     def load(cls, env_path: Optional[Path] = None) -> "Settings":
@@ -36,11 +37,13 @@ class Settings:
         transcription_model = os.getenv("OPENAI_TRANSCRIPTION_MODEL", cls.transcription_model)
         sample_rate = int(os.getenv("AUDIO_SAMPLE_RATE", str(cls.sample_rate)))
         chunk_duration = float(os.getenv("AUDIO_CHUNK_DURATION", str(cls.chunk_duration)))
+        embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", cls.embedding_model)
 
         return cls(
             openai_api_key=api_key,
             model=model,
             transcription_model=transcription_model,
+            embedding_model=embedding_model,
             sample_rate=sample_rate,
             chunk_duration=chunk_duration,
         )
