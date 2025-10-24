@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .audio_capture import MicrophoneListener
+from .chatgpt_sync import ChatGPTSync, ChatGPTSyncError
 from .config import Settings, get_settings
 from .knowledge_base import KnowledgeBase
 from .openai_client import AIClient, DEFAULT_SYSTEM_PROMPT
@@ -40,6 +41,7 @@ class ChatSession:
     transcript_segments: List[str] = field(default_factory=list)
     transcript_display: str = ""
     assistant_segments: List[str] = field(default_factory=list)
+    chatgpt_conversation_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.conversation:
@@ -203,16 +205,18 @@ class MainWindow(QMainWindow):
         self.settings: Optional[Settings] = None
         self.ai_client: Optional[AIClient] = None
         self.knowledge_base: Optional[KnowledgeBase] = None
+        self.chatgpt_sync: Optional[ChatGPTSync] = None
         self.listener: Optional[MicrophoneListener] = None
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[TranscriptionWorker] = None
         self.session_bridge: Optional[SessionSwitchBridge] = None
 
         self.sessions: Dict[str, ChatSession] = {}
+        self.chatgpt_session_map: Dict[str, str] = {}
         self.current_session_id: Optional[str] = None
 
         self._setup_ui()
-        self._create_new_session()
+        QTimer.singleShot(0, self._post_init_setup)
 
     def _setup_ui(self) -> None:
         central_widget = QWidget()
@@ -260,6 +264,11 @@ class MainWindow(QMainWindow):
         new_chat_button.clicked.connect(self._on_new_chat)
         buttons_layout.addWidget(new_chat_button)
 
+        self.sync_button = QPushButton("Sync ChatGPT")
+        self.sync_button.setEnabled(False)
+        self.sync_button.clicked.connect(self._on_sync_chatgpt)
+        buttons_layout.addWidget(self.sync_button)
+
         load_button = QPushButton("Load reference files…")
         load_button.clicked.connect(self._load_reference_material)
         buttons_layout.addWidget(load_button)
@@ -304,6 +313,22 @@ class MainWindow(QMainWindow):
         palette.setColor(QPalette.ColorRole.Window, QColor("#f0f2f5"))
         self.setPalette(palette)
 
+    def _post_init_setup(self) -> None:
+        error_message: Optional[str] = None
+        try:
+            self._initialize_clients()
+        except Exception as exc:
+            error_message = str(exc)
+
+        if self.chatgpt_sync:
+            self._refresh_chatgpt_sessions(initial=True)
+
+        if not self.sessions:
+            self._create_new_session()
+
+        if error_message:
+            QMessageBox.warning(self, "Configuration warning", error_message)
+
     def _wrap_with_label(self, label: str, widget: QWidget) -> QWidget:
         container = QWidget()
         container_layout = QVBoxLayout(container)
@@ -313,6 +338,135 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(title)
         container_layout.addWidget(widget)
         return container
+
+    def _initialize_clients(self) -> None:
+        if self.settings:
+            return
+
+        settings = get_settings()
+        self.settings = settings
+        self.ai_client = AIClient(settings)
+        self.knowledge_base = KnowledgeBase(self.ai_client)
+
+        if settings.chatgpt_access_token:
+            self.chatgpt_sync = ChatGPTSync(
+                settings.chatgpt_access_token,
+                base_url=settings.chatgpt_base_url,
+            )
+            self.sync_button.setEnabled(True)
+            self.sync_button.setToolTip("Refresh conversation history from ChatGPT")
+        else:
+            self.sync_button.setToolTip(
+                "Set CHATGPT_ACCESS_TOKEN in your environment to enable ChatGPT syncing."
+            )
+
+    def _refresh_chatgpt_sessions(self, initial: bool = False) -> None:
+        if not self.chatgpt_sync or not self.settings:
+            if not initial:
+                QMessageBox.information(
+                    self,
+                    "ChatGPT sync unavailable",
+                    "Provide a CHATGPT_ACCESS_TOKEN in your environment to import chats.",
+                )
+            return
+
+        try:
+            conversations = self.chatgpt_sync.list_conversations(
+                limit=self.settings.chatgpt_sync_limit
+            )
+        except ChatGPTSyncError as exc:
+            if not initial:
+                QMessageBox.warning(self, "ChatGPT sync failed", str(exc))
+            return
+
+        imported_new = False
+        for conversation in conversations:
+            try:
+                messages = self.chatgpt_sync.fetch_messages(conversation.conversation_id)
+            except ChatGPTSyncError as exc:
+                if not initial:
+                    QMessageBox.warning(self, "ChatGPT sync failed", str(exc))
+                continue
+
+            existing_session_id = self.chatgpt_session_map.get(conversation.conversation_id)
+            if existing_session_id and existing_session_id in self.sessions:
+                session = self.sessions[existing_session_id]
+                self._apply_messages_to_session(session, messages, conversation.title)
+                self._update_session_item_title(existing_session_id, session.title)
+                if existing_session_id == self.current_session_id:
+                    self._render_session(session)
+            else:
+                session = self._create_session_from_chatgpt(
+                    conversation.conversation_id, conversation.title, messages
+                )
+                if session:
+                    imported_new = True
+
+        if imported_new and not initial:
+            QMessageBox.information(
+                self,
+                "ChatGPT sync",
+                "Imported the latest conversations from your ChatGPT account.",
+            )
+
+    def _apply_messages_to_session(
+        self, session: ChatSession, messages: List[dict[str, str]], title: str
+    ) -> None:
+        session.title = title or session.title
+        system_message = (
+            dict(self.ai_client.system_message)
+            if self.ai_client
+            else {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+        )
+        session.conversation = [system_message]
+        session.transcript_segments = []
+        session.transcript_display = ""
+        session.assistant_segments = []
+
+        for message in messages:
+            role = message.get("role", "user")
+            content = (message.get("content") or "").strip()
+            if not content:
+                continue
+
+            session.conversation.append({"role": role, "content": content})
+            if role == "assistant":
+                session.assistant_segments.append(content)
+            else:
+                session.transcript_segments.append(content)
+                if session.transcript_display and not session.transcript_display.endswith((" ", "\n")):
+                    session.transcript_display += "\n"
+                session.transcript_display += content
+                if not session.transcript_display.endswith("\n"):
+                    session.transcript_display += "\n"
+
+    def _create_session_from_chatgpt(
+        self,
+        conversation_id: str,
+        title: str,
+        messages: List[dict[str, str]],
+    ) -> Optional[ChatSession]:
+        session = ChatSession(
+            session_id=str(uuid.uuid4()),
+            title=title or "ChatGPT chat",
+            chatgpt_conversation_id=conversation_id,
+        )
+        self._apply_messages_to_session(session, messages, session.title)
+        self.chatgpt_session_map[conversation_id] = session.session_id
+        self._register_session(session, make_current=False)
+        return session
+
+    def _update_session_item_title(self, session_id: str, title: str) -> None:
+        for index in range(self.session_list.count()):
+            item = self.session_list.item(index)
+            item_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_id and str(item_id) == session_id:
+                if item.text() != title:
+                    item.setText(title)
+                break
+
+    def _on_sync_chatgpt(self) -> None:
+        self._refresh_chatgpt_sessions()
 
     def _toggle_listening(self, checked: bool) -> None:
         if checked:
@@ -447,25 +601,30 @@ class MainWindow(QMainWindow):
 
     def _ensure_client(self) -> AIClient:
         if not self.ai_client:
-            self.settings = get_settings()
-            self.ai_client = AIClient(self.settings)
-            if not self.knowledge_base:
-                self.knowledge_base = KnowledgeBase(self.ai_client)
+            self._initialize_clients()
+        if not self.ai_client:
+            raise RuntimeError("OpenAI client is not configured.")
         return self.ai_client
 
-    def _create_new_session(self) -> ChatSession:
-        session_id = str(uuid.uuid4())
-        session = ChatSession(session_id=session_id, title=f"Session {len(self.sessions) + 1}")
-        self.sessions[session_id] = session
+    def _create_new_session(self, title: Optional[str] = None) -> ChatSession:
+        session = ChatSession(
+            session_id=str(uuid.uuid4()),
+            title=title or f"Session {len(self.sessions) + 1}",
+        )
+        self._register_session(session, make_current=True)
+        return session
+
+    def _register_session(self, session: ChatSession, make_current: bool = False) -> None:
+        self.sessions[session.session_id] = session
 
         item = QListWidgetItem(session.title)
-        item.setData(Qt.ItemDataRole.UserRole, session_id)
+        item.setData(Qt.ItemDataRole.UserRole, session.session_id)
         self.session_list.addItem(item)
-        self.session_list.setCurrentItem(item)
 
-        self.current_session_id = session_id
-        self._render_session(session)
-        return session
+        if make_current or self.session_list.count() == 1:
+            self.session_list.setCurrentItem(item)
+            self.current_session_id = session.session_id
+            self._render_session(session)
 
     def _on_new_chat(self) -> None:
         self._create_new_session()

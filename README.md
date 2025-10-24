@@ -8,6 +8,7 @@ A lightweight desktop application for macOS that listens to live conversations, 
 - 💡 Conversational responses generated with OpenAI GPT models
 - 🗂️ Manage multiple concurrent chats, each with its own transcript and assistant history
 - 🧠 Upload custom reference documents so responses stay anchored to your material
+- 🔁 Sync existing ChatGPT conversations so both panes mirror your account history
 - 🪟 Intuitive split-pane UI built with PyQt6 and responsive scrolling panes
 - 🔐 Configurable with environment variables or a `.env` file
 
@@ -38,6 +39,16 @@ python -m src.main
 
 When you press **Start Listening**, the assistant begins buffering audio from the default system microphone. Short transcript snippets (about every 1–2 seconds) stream into the left pane, and once a complete thought is detected the assistant responds on the right. Use **Stop Listening** to pause capture, create additional chats for new scenarios, and reload custom reference material at any time.
 
+### Connecting your ChatGPT account
+
+To mirror the conversations that already live in your ChatGPT account:
+
+1. Sign in to [chat.openai.com](https://chat.openai.com/) in your browser and open the developer tools application tab.
+2. Locate the `__Secure-next-auth.session-token` cookie, copy its value, and add it to your `.env` file as `CHATGPT_ACCESS_TOKEN`.
+3. Restart the desktop app and click **Sync ChatGPT** in the sidebar. The most recent conversations appear in the chat list, and selecting one loads the transcript and responses exactly as they exist online.
+
+Live transcriptions and answers now incorporate that imported context so replies stay grounded in the specific work you have already done inside ChatGPT.
+
 ### Configuration
 | Variable | Description | Default |
 | --- | --- | --- |
@@ -47,6 +58,9 @@ When you press **Start Listening**, the assistant begins buffering audio from th
 | `OPENAI_EMBEDDING_MODEL` | Embedding model for the knowledge base | `text-embedding-3-small` |
 | `AUDIO_SAMPLE_RATE` | Sample rate for microphone capture | `16000` |
 | `AUDIO_CHUNK_DURATION` | Length of each audio segment in seconds | `1.5` |
+| `CHATGPT_ACCESS_TOKEN` | ChatGPT web access token used to import conversations | *(optional)* |
+| `CHATGPT_BASE_URL` | Base URL for the ChatGPT web API | `https://chat.openai.com/backend-api` |
+| `CHATGPT_SYNC_LIMIT` | Number of recent ChatGPT conversations to mirror | `12` |
 
 You can tweak chunk length or sample rate to balance latency and accuracy.
 
