@@ -350,8 +350,9 @@ class MainWindow(QMainWindow):
 
         if settings.chatgpt_access_token:
             self.chatgpt_sync = ChatGPTSync(
-                settings.chatgpt_access_token,
+                session_token=settings.chatgpt_access_token,
                 base_url=settings.chatgpt_base_url,
+                bearer_token=settings.chatgpt_bearer_token,
             )
             self.sync_button.setEnabled(True)
             self.sync_button.setToolTip("Refresh conversation history from ChatGPT")

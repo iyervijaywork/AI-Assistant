@@ -45,7 +45,8 @@ To mirror the conversations that already live in your ChatGPT account:
 
 1. Sign in to [chat.openai.com](https://chat.openai.com/) in your browser and open the developer tools application tab.
 2. Locate the `__Secure-next-auth.session-token` cookie, copy its value, and add it to your `.env` file as `CHATGPT_ACCESS_TOKEN`. (This value must stay fresh—re-copy it whenever the web session expires.)
-3. Restart the desktop app and click **Sync ChatGPT** in the sidebar. The most recent conversations appear in the chat list, and selecting one loads the transcript and responses exactly as they exist online.
+3. In some regions ChatGPT no longer returns a bearer token automatically. If you see a message asking for a bearer token, open the browser network tab, filter for `session` requests, and copy the `Authorization: Bearer ...` value into `CHATGPT_BEARER_TOKEN` in your `.env` file.
+4. Restart the desktop app and click **Sync ChatGPT** in the sidebar. The most recent conversations appear in the chat list, and selecting one loads the transcript and responses exactly as they exist online.
 
 If you see an "Enable JavaScript and cookies to continue" error during sync, the session cookie is no longer valid. Repeat the steps above to grab a current `__Secure-next-auth.session-token` from an active browser session and restart the app.
 
@@ -60,7 +61,8 @@ Live transcriptions and answers now incorporate that imported context so replies
 | `OPENAI_EMBEDDING_MODEL` | Embedding model for the knowledge base | `text-embedding-3-small` |
 | `AUDIO_SAMPLE_RATE` | Sample rate for microphone capture | `16000` |
 | `AUDIO_CHUNK_DURATION` | Length of each audio segment in seconds | `1.5` |
-| `CHATGPT_ACCESS_TOKEN` | ChatGPT web access token used to import conversations | *(optional)* |
+| `CHATGPT_ACCESS_TOKEN` | ChatGPT session cookie used to import conversations | *(optional)* |
+| `CHATGPT_BEARER_TOKEN` | Manual bearer token override if auto retrieval fails | *(optional)* |
 | `CHATGPT_BASE_URL` | Base URL for the ChatGPT web API | `https://chat.openai.com/backend-api` |
 | `CHATGPT_SYNC_LIMIT` | Number of recent ChatGPT conversations to mirror | `12` |
 

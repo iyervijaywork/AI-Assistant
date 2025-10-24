@@ -24,12 +24,13 @@ class ChatGPTSync:
 
     def __init__(
         self,
-        access_token: str,
+        session_token: str,
         base_url: str = "https://chat.openai.com/backend-api",
         timeout: float = 15.0,
+        bearer_token: Optional[str] = None,
     ) -> None:
-        if not access_token:
-            raise ValueError("A ChatGPT access token is required for synchronisation.")
+        if not session_token:
+            raise ValueError("A ChatGPT session token is required for synchronisation.")
 
         self.base_url = base_url.rstrip("/")
         self.origin = "https://chat.openai.com"
@@ -48,15 +49,18 @@ class ChatGPTSync:
                 "Origin": "https://chat.openai.com",
             }
         )
-        # The ChatGPT web backend expects the session cookie rather than a bearer token.
+        # The ChatGPT web backend expects the session cookie when minting a bearer token.
         # Provide the value copied from the browser's `__Secure-next-auth.session-token`.
         self.session.cookies.set(
             "__Secure-next-auth.session-token",
-            access_token,
+            session_token,
             domain="chat.openai.com",
+            secure=True,
         )
-        self._access_token: Optional[str] = None
+        self._access_token: Optional[str] = bearer_token
         self._access_token_expires_at: Optional[float] = None
+        self._manual_bearer = bearer_token is not None
+        self._token_unavailable = False
 
     def list_conversations(self, limit: int = 12) -> List[ChatGPTConversation]:
         """Return the most recent ChatGPT conversations."""
@@ -139,18 +143,23 @@ class ChatGPTSync:
 
         self._ensure_access_token()
         headers = kwargs.pop("headers", {}) or {}
-        headers.setdefault("Authorization", f"Bearer {self._access_token}")
+        if self._access_token:
+            headers.setdefault("Authorization", f"Bearer {self._access_token}")
+        else:
+            headers.pop("Authorization", None)
         response = self.session.get(
             endpoint,
             headers=headers,
             timeout=self.timeout,
             **kwargs,
         )
-        if response.status_code == 401:
+        if response.status_code == 401 and self._access_token:
             # The access token likely expired. Refresh and retry once.
             self._access_token = None
             self._access_token_expires_at = None
             self._ensure_access_token()
+            if not self._access_token:
+                return response
             headers["Authorization"] = f"Bearer {self._access_token}"
             response = self.session.get(
                 endpoint,
@@ -158,12 +167,19 @@ class ChatGPTSync:
                 timeout=self.timeout,
                 **kwargs,
             )
+        elif response.status_code == 401:
+            raise ChatGPTSyncError(
+                "ChatGPT rejected the request using only the session cookie. "
+                "Provide a valid bearer token via CHATGPT_BEARER_TOKEN or refresh the session."
+            )
         return response
 
     def _ensure_access_token(self) -> None:
         """Retrieve and cache a bearer token for ChatGPT web requests."""
 
         if self._access_token and self._token_is_fresh():
+            return
+        if self._manual_bearer or self._token_unavailable:
             return
 
         session_endpoint = f"{self.origin}/api/auth/session"
@@ -182,11 +198,17 @@ class ChatGPTSync:
                 "Unexpected response while retrieving ChatGPT access token."
             ) from exc
 
-        token = payload.get("accessToken") if isinstance(payload, dict) else None
+        token = None
+        if isinstance(payload, dict):
+            token = payload.get("accessToken") or payload.get("access_token")
         if not token:
-            raise ChatGPTSyncError(
-                "No ChatGPT access token was returned. Refresh your browser session and try again."
-            )
+            # Some accounts no longer expose an access token via the session
+            # endpoint. Fall back to cookie-only requests and surface clearer
+            # guidance if those requests later fail.
+            self._token_unavailable = True
+            self._access_token = None
+            self._access_token_expires_at = None
+            return
 
         expires_at = self._parse_expiry(payload.get("accessTokenExpires") or payload.get("expires"))
         self._access_token = token
