@@ -44,8 +44,10 @@ When you press **Start Listening**, the assistant begins buffering audio from th
 To mirror the conversations that already live in your ChatGPT account:
 
 1. Sign in to [chat.openai.com](https://chat.openai.com/) in your browser and open the developer tools application tab.
-2. Locate the `__Secure-next-auth.session-token` cookie, copy its value, and add it to your `.env` file as `CHATGPT_ACCESS_TOKEN`.
+2. Locate the `__Secure-next-auth.session-token` cookie, copy its value, and add it to your `.env` file as `CHATGPT_ACCESS_TOKEN`. (This value must stay fresh—re-copy it whenever the web session expires.)
 3. Restart the desktop app and click **Sync ChatGPT** in the sidebar. The most recent conversations appear in the chat list, and selecting one loads the transcript and responses exactly as they exist online.
+
+If you see an "Enable JavaScript and cookies to continue" error during sync, the session cookie is no longer valid. Repeat the steps above to grab a current `__Secure-next-auth.session-token` from an active browser session and restart the app.
 
 Live transcriptions and answers now incorporate that imported context so replies stay grounded in the specific work you have already done inside ChatGPT.
 

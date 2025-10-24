@@ -33,10 +33,23 @@ class ChatGPTSync:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "Authorization": f"Bearer {access_token}",
                 "Accept": "application/json",
                 "Content-Type": "application/json",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Referer": "https://chat.openai.com/",
+                "Origin": "https://chat.openai.com",
             }
+        )
+        # The ChatGPT web backend expects the session cookie rather than a bearer token.
+        # Provide the value copied from the browser's `__Secure-next-auth.session-token`.
+        self.session.cookies.set(
+            "__Secure-next-auth.session-token",
+            access_token,
+            domain="chat.openai.com",
         )
 
     def list_conversations(self, limit: int = 12) -> List[ChatGPTConversation]:
@@ -95,8 +108,17 @@ class ChatGPTSync:
         return ordered
 
     def _raise_for_status(self, response: requests.Response) -> None:
-        if response.ok:
+        if response.ok and "application/json" in response.headers.get("Content-Type", ""):
             return
+        # ChatGPT sometimes serves an HTML challenge page that asks the user to
+        # enable JavaScript and cookies. Surface a clearer hint in that case so
+        # users know to refresh their session token from the browser.
+        if "text/html" in response.headers.get("Content-Type", ""):
+            raise ChatGPTSyncError(
+                "Received an HTML challenge page from ChatGPT. "
+                "Verify that your session cookie is valid and that you've copied "
+                "the `__Secure-next-auth.session-token` value from an active browser session."
+            )
         try:
             payload = response.json()
         except ValueError:
