@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Optional
+
+import time
 
 import requests
 
@@ -29,6 +32,7 @@ class ChatGPTSync:
             raise ValueError("A ChatGPT access token is required for synchronisation.")
 
         self.base_url = base_url.rstrip("/")
+        self.origin = "https://chat.openai.com"
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update(
@@ -51,15 +55,16 @@ class ChatGPTSync:
             access_token,
             domain="chat.openai.com",
         )
+        self._access_token: Optional[str] = None
+        self._access_token_expires_at: Optional[float] = None
 
     def list_conversations(self, limit: int = 12) -> List[ChatGPTConversation]:
         """Return the most recent ChatGPT conversations."""
 
         endpoint = f"{self.base_url}/conversations"
-        response = self.session.get(
+        response = self._authorized_get(
             endpoint,
             params={"offset": 0, "limit": max(limit, 1)},
-            timeout=self.timeout,
         )
         self._raise_for_status(response)
         payload = response.json() if response.content else {}
@@ -77,7 +82,7 @@ class ChatGPTSync:
         """Return ordered messages for a specific ChatGPT conversation."""
 
         endpoint = f"{self.base_url}/conversation/{conversation_id}"
-        response = self.session.get(endpoint, timeout=self.timeout)
+        response = self._authorized_get(endpoint)
         self._raise_for_status(response)
         payload = response.json() if response.content else {}
         mapping: Dict[str, Dict[str, object]] = payload.get("mapping", {})
@@ -128,6 +133,86 @@ class ChatGPTSync:
         else:
             message = response.text
         raise ChatGPTSyncError(message or f"ChatGPT API call failed with status {response.status_code}")
+
+    def _authorized_get(self, endpoint: str, **kwargs) -> requests.Response:
+        """Issue a GET request with a valid ChatGPT bearer token."""
+
+        self._ensure_access_token()
+        headers = kwargs.pop("headers", {}) or {}
+        headers.setdefault("Authorization", f"Bearer {self._access_token}")
+        response = self.session.get(
+            endpoint,
+            headers=headers,
+            timeout=self.timeout,
+            **kwargs,
+        )
+        if response.status_code == 401:
+            # The access token likely expired. Refresh and retry once.
+            self._access_token = None
+            self._access_token_expires_at = None
+            self._ensure_access_token()
+            headers["Authorization"] = f"Bearer {self._access_token}"
+            response = self.session.get(
+                endpoint,
+                headers=headers,
+                timeout=self.timeout,
+                **kwargs,
+            )
+        return response
+
+    def _ensure_access_token(self) -> None:
+        """Retrieve and cache a bearer token for ChatGPT web requests."""
+
+        if self._access_token and self._token_is_fresh():
+            return
+
+        session_endpoint = f"{self.origin}/api/auth/session"
+        response = self.session.get(session_endpoint, timeout=self.timeout)
+        if response.status_code in {401, 403}:
+            raise ChatGPTSyncError(
+                "ChatGPT rejected the provided session cookie. "
+                "Refresh the `__Secure-next-auth.session-token` value from an active browser session."
+            )
+        self._raise_for_status(response)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:  # pragma: no cover - defensive parsing guard
+            raise ChatGPTSyncError(
+                "Unexpected response while retrieving ChatGPT access token."
+            ) from exc
+
+        token = payload.get("accessToken") if isinstance(payload, dict) else None
+        if not token:
+            raise ChatGPTSyncError(
+                "No ChatGPT access token was returned. Refresh your browser session and try again."
+            )
+
+        expires_at = self._parse_expiry(payload.get("accessTokenExpires") or payload.get("expires"))
+        self._access_token = token
+        self._access_token_expires_at = expires_at
+
+    def _token_is_fresh(self) -> bool:
+        if not self._access_token:
+            return False
+        if self._access_token_expires_at is None:
+            return True
+        # Refresh the token a little before it expires to avoid mid-request failures.
+        return time.time() < self._access_token_expires_at - 30
+
+    @staticmethod
+    def _parse_expiry(expires: Optional[str]) -> Optional[float]:
+        if not expires:
+            return None
+        try:
+            if expires.endswith("Z"):
+                expires = expires[:-1] + "+00:00"
+            dt = datetime.fromisoformat(expires)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:  # pragma: no cover - tolerate unexpected formats
+            return None
 
 
 __all__ = ["ChatGPTSync", "ChatGPTConversation", "ChatGPTSyncError"]
