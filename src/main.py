@@ -13,12 +13,16 @@ from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QTextEdit,
@@ -34,26 +38,75 @@ from .openai_client import AIClient, DEFAULT_SYSTEM_PROMPT
 
 
 @dataclass
+class PreparationProfile:
+    interview_type: str = ""
+    role: str = ""
+    company: str = ""
+    focus_areas: str = ""
+    success_criteria: str = ""
+
+    def summary_lines(self) -> List[str]:
+        lines: List[str] = []
+        if self.interview_type:
+            lines.append(f"Interview type: {self.interview_type.strip()}")
+        if self.role:
+            lines.append(f"Role: {self.role.strip()}")
+        if self.company:
+            lines.append(f"Company: {self.company.strip()}")
+        if self.focus_areas:
+            focus = " ".join(self.focus_areas.split())
+            lines.append(f"Focus areas: {focus}")
+        if self.success_criteria:
+            success = " ".join(self.success_criteria.split())
+            lines.append(f"Success criteria: {success}")
+        return lines
+
+    def description(self) -> str:
+        lines = self.summary_lines()
+        return "\n".join(lines)
+
+
+@dataclass
+class QAPair:
+    question: str
+    answer: str = ""
+
+
+@dataclass
 class ChatSession:
     session_id: str
     title: str
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
     conversation: List[dict[str, str]] = field(default_factory=list)
     transcript_segments: List[str] = field(default_factory=list)
-    transcript_display: str = ""
+    transcript_questions: List[str] = field(default_factory=list)
+    partial_question: str = ""
     assistant_segments: List[str] = field(default_factory=list)
+    assistant_display_segments: List[str] = field(default_factory=list)
+    qa_pairs: List[QAPair] = field(default_factory=list)
+    prep_notes: str = ""
     chatgpt_conversation_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.conversation:
-            self.conversation.append({"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
+            self.conversation.append({"role": "system", "content": self.system_prompt})
 
     @property
     def transcript_text(self) -> str:
-        return self.transcript_display
+        lines: List[str] = []
+        for index, question in enumerate(self.transcript_questions, start=1):
+            cleaned = question.strip()
+            if cleaned:
+                lines.append(f"Q{index}: {cleaned}")
+        if self.partial_question:
+            lines.append(
+                f"Q{len(self.transcript_questions) + 1} (capturing): {self.partial_question.strip()}"
+            )
+        return "\n\n".join(lines).strip()
 
     @property
     def assistant_text(self) -> str:
-        return "\n\n".join(self.assistant_segments).strip()
+        return "\n\n".join(self.assistant_display_segments).strip()
 
     @property
     def last_transcript_segment(self) -> str:
@@ -214,6 +267,7 @@ class MainWindow(QMainWindow):
         self.sessions: Dict[str, ChatSession] = {}
         self.chatgpt_session_map: Dict[str, str] = {}
         self.current_session_id: Optional[str] = None
+        self.prep_profile: PreparationProfile = PreparationProfile()
 
         self._setup_ui()
         QTimer.singleShot(0, self._post_init_setup)
@@ -258,6 +312,50 @@ class MainWindow(QMainWindow):
         self.session_list.setStyleSheet("QListWidget { background: #ffffff; border-radius: 6px; }")
         self.session_list.currentItemChanged.connect(self._on_session_selected)
         sidebar_layout.addWidget(self.session_list, 1)
+
+        prep_group = QGroupBox("Interview Prep")
+        prep_group.setStyleSheet(
+            "QGroupBox { font-size: 16px; font-weight: 500; margin-top: 12px; }"
+        )
+        prep_layout = QFormLayout(prep_group)
+        prep_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        prep_layout.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        self.interview_type_input = QLineEdit()
+        self.interview_type_input.setPlaceholderText("e.g. Behavioral, Technical")
+        prep_layout.addRow("Type", self.interview_type_input)
+
+        self.role_input = QLineEdit()
+        self.role_input.setPlaceholderText("Target role title")
+        prep_layout.addRow("Role", self.role_input)
+
+        self.company_input = QLineEdit()
+        self.company_input.setPlaceholderText("Company or team")
+        prep_layout.addRow("Company", self.company_input)
+
+        self.focus_input = QPlainTextEdit()
+        self.focus_input.setPlaceholderText("Key focus areas or anticipated topics…")
+        self.focus_input.setMaximumHeight(70)
+        prep_layout.addRow("Focus", self.focus_input)
+
+        self.success_input = QPlainTextEdit()
+        self.success_input.setPlaceholderText(
+            "Any success criteria, must-mention stories, or preparation prompts…"
+        )
+        self.success_input.setMaximumHeight(70)
+        prep_layout.addRow("Success", self.success_input)
+
+        self.apply_prep_button = QPushButton("Apply prep context")
+        self.apply_prep_button.clicked.connect(self._apply_prep_context)
+        prep_layout.addRow(self.apply_prep_button)
+
+        self.prep_summary_label = QLabel("No prep context applied.")
+        self.prep_summary_label.setWordWrap(True)
+        self.prep_summary_label.setStyleSheet("color: #555; font-size: 12px;")
+        prep_layout.addRow(self.prep_summary_label)
+
+        sidebar_layout.addWidget(prep_group)
+        self._update_prep_summary_label()
 
         buttons_layout = QVBoxLayout()
         new_chat_button = QPushButton("New chat")
@@ -339,6 +437,35 @@ class MainWindow(QMainWindow):
         container_layout.addWidget(widget)
         return container
 
+    def _update_prep_summary_label(self) -> None:
+        if not hasattr(self, "prep_summary_label"):
+            return
+        summary = self.prep_profile.description().strip()
+        if summary:
+            self.prep_summary_label.setText(summary)
+        else:
+            self.prep_summary_label.setText("No prep context applied.")
+
+    def _compose_system_prompt(self, profile: Optional[PreparationProfile] = None) -> str:
+        profile = profile or self.prep_profile
+        base_prompt = DEFAULT_SYSTEM_PROMPT
+        structure_prompt = (
+            "Always deliver structured interview answers using this outline:\n"
+            "1. Headline Summary — one sentence that directly answers the question.\n"
+            "2. Supporting Evidence — 2-4 bullet points with metrics, STAR stories, or examples.\n"
+            "3. Improvement & Risks — candid reflections on gaps, trade-offs, or lessons.\n"
+            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer."
+        )
+
+        context_lines = profile.summary_lines()
+        context_block = ""
+        if context_lines:
+            formatted = "\n".join(f"- {line}" for line in context_lines)
+            context_block = f"Interview context:\n{formatted}"
+
+        components = [base_prompt, structure_prompt, context_block]
+        return "\n\n".join(part for part in components if part).strip()
+
     def _initialize_clients(self) -> None:
         if self.settings:
             return
@@ -360,6 +487,38 @@ class MainWindow(QMainWindow):
             self.sync_button.setToolTip(
                 "Set CHATGPT_ACCESS_TOKEN in your environment to enable ChatGPT syncing."
             )
+
+    def _apply_prep_context(self) -> None:
+        profile = PreparationProfile(
+            interview_type=self.interview_type_input.text().strip(),
+            role=self.role_input.text().strip(),
+            company=self.company_input.text().strip(),
+            focus_areas=self.focus_input.toPlainText().strip(),
+            success_criteria=self.success_input.toPlainText().strip(),
+        )
+        self.prep_profile = profile
+        self._update_prep_summary_label()
+
+        if self.current_session_id:
+            session = self.sessions[self.current_session_id]
+            session.system_prompt = self._compose_system_prompt(profile)
+            session.prep_notes = profile.description()
+            if session.conversation:
+                session.conversation[0] = {"role": "system", "content": session.system_prompt}
+            else:
+                session.conversation.append({"role": "system", "content": session.system_prompt})
+
+            if self.worker and self.session_bridge:
+                self.session_bridge.requested.emit(
+                    session.session_id,
+                    list(session.conversation),
+                    session.last_transcript_segment,
+                )
+
+            if session.prep_notes:
+                self.prep_summary_label.setText(session.prep_notes)
+
+        self.status_label.setText("Prep context applied")
 
     def _refresh_chatgpt_sessions(self, initial: bool = False) -> None:
         if not self.chatgpt_sync or not self.settings:
@@ -419,10 +578,15 @@ class MainWindow(QMainWindow):
             if self.ai_client
             else {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
         )
+        session.system_prompt = system_message.get("content", DEFAULT_SYSTEM_PROMPT)
         session.conversation = [system_message]
         session.transcript_segments = []
-        session.transcript_display = ""
+        session.transcript_questions = []
+        session.partial_question = ""
         session.assistant_segments = []
+        session.assistant_display_segments = []
+        session.qa_pairs = []
+        session.prep_notes = ""
 
         for message in messages:
             role = message.get("role", "user")
@@ -433,13 +597,19 @@ class MainWindow(QMainWindow):
             session.conversation.append({"role": role, "content": content})
             if role == "assistant":
                 session.assistant_segments.append(content)
+                if session.qa_pairs:
+                    session.qa_pairs[-1].answer = content
+                    session.assistant_display_segments.append(
+                        self._format_structured_answer(
+                            len(session.qa_pairs), session.qa_pairs[-1].question, content
+                        )
+                    )
+                else:
+                    session.assistant_display_segments.append(content)
             else:
                 session.transcript_segments.append(content)
-                if session.transcript_display and not session.transcript_display.endswith((" ", "\n")):
-                    session.transcript_display += "\n"
-                session.transcript_display += content
-                if not session.transcript_display.endswith("\n"):
-                    session.transcript_display += "\n"
+                session.transcript_questions.append(content)
+                session.qa_pairs.append(QAPair(question=content))
 
     def _create_session_from_chatgpt(
         self,
@@ -450,6 +620,9 @@ class MainWindow(QMainWindow):
         session = ChatSession(
             session_id=str(uuid.uuid4()),
             title=title or "ChatGPT chat",
+            system_prompt=self.ai_client.system_message.get("content", DEFAULT_SYSTEM_PROMPT)
+            if self.ai_client
+            else DEFAULT_SYSTEM_PROMPT,
             chatgpt_conversation_id=conversation_id,
         )
         self._apply_messages_to_session(session, messages, session.title)
@@ -560,11 +733,10 @@ class MainWindow(QMainWindow):
         session.transcript_segments.append(text)
         cleaned = text.strip()
         if cleaned:
-            if session.transcript_display and not session.transcript_display.endswith((" ", "\n")):
-                session.transcript_display += " "
-            session.transcript_display += cleaned
-            if cleaned.endswith((".", "?", "!")):
-                session.transcript_display += "\n"
+            if session.partial_question:
+                session.partial_question = f"{session.partial_question} {cleaned}".strip()
+            else:
+                session.partial_question = cleaned
 
         if session_id == self.current_session_id:
             self.transcript_view.setPlainText(session.transcript_text)
@@ -577,7 +749,16 @@ class MainWindow(QMainWindow):
             return
 
         session.conversation.append({"role": "user", "content": message})
+        question = message.strip()
+        if question:
+            session.transcript_questions.append(question)
+            session.qa_pairs.append(QAPair(question=question))
+        session.partial_question = ""
         self._trim_session_history(session)
+
+        if session_id == self.current_session_id:
+            self.transcript_view.setPlainText(session.transcript_text)
+            self._auto_scroll(self.transcript_view)
 
     @pyqtSlot(str, str)
     def _append_assistant(self, session_id: str, text: str) -> None:
@@ -587,6 +768,15 @@ class MainWindow(QMainWindow):
 
         session.assistant_segments.append(text)
         session.conversation.append({"role": "assistant", "content": text})
+
+        if session.qa_pairs:
+            session.qa_pairs[-1].answer = text.strip()
+            formatted = self._format_structured_answer(
+                len(session.qa_pairs), session.qa_pairs[-1].question, text
+            )
+            session.assistant_display_segments.append(formatted)
+        else:
+            session.assistant_display_segments.append(text.strip())
         self._trim_session_history(session)
 
         if session_id == self.current_session_id:
@@ -600,6 +790,14 @@ class MainWindow(QMainWindow):
     def _auto_scroll(self, widget: QTextEdit) -> None:
         widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
 
+    def _format_structured_answer(self, index: int, question: str, answer: str) -> str:
+        heading = f"Q{index}: {question.strip()}"
+        divider = "-" * min(len(heading), 80)
+        body = answer.strip()
+        if not body:
+            return heading
+        return f"{heading}\n{divider}\n{body}"
+
     def _ensure_client(self) -> AIClient:
         if not self.ai_client:
             self._initialize_clients()
@@ -608,9 +806,12 @@ class MainWindow(QMainWindow):
         return self.ai_client
 
     def _create_new_session(self, title: Optional[str] = None) -> ChatSession:
+        system_prompt = self._compose_system_prompt()
         session = ChatSession(
             session_id=str(uuid.uuid4()),
             title=title or f"Session {len(self.sessions) + 1}",
+            system_prompt=system_prompt,
+            prep_notes=self.prep_profile.description(),
         )
         self._register_session(session, make_current=True)
         return session
@@ -656,6 +857,10 @@ class MainWindow(QMainWindow):
         self._auto_scroll(self.transcript_view)
         self.assistant_view.setPlainText(session.assistant_text)
         self._auto_scroll(self.assistant_view)
+        if session.prep_notes:
+            self.prep_summary_label.setText(session.prep_notes)
+        else:
+            self._update_prep_summary_label()
 
     def _trim_session_history(self, session: ChatSession, max_turns: int = 20) -> None:
         if len(session.conversation) <= 1:

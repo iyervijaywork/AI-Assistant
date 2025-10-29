@@ -8,6 +8,8 @@ A lightweight desktop application for macOS that listens to live conversations, 
 - 💡 Conversational responses generated with OpenAI GPT models
 - 🗂️ Manage multiple concurrent chats, each with its own transcript and assistant history
 - 🧠 Upload custom reference documents so responses stay anchored to your material
+- 🧭 Capture interview prep context (type, role, company, focus areas) so answers stay tailored
+- 🗒️ Organize every question and answer pair with numbered transcripts and structured replies
 - 🔁 Sync existing ChatGPT conversations so both panes mirror your account history
 - 🪟 Intuitive split-pane UI built with PyQt6 and responsive scrolling panes
 - 🔐 Configurable with environment variables or a `.env` file
@@ -38,6 +40,16 @@ python -m src.main
 ```
 
 When you press **Start Listening**, the assistant begins buffering audio from the default system microphone. Short transcript snippets (about every 1–2 seconds) stream into the left pane, and once a complete thought is detected the assistant responds on the right. Use **Stop Listening** to pause capture, create additional chats for new scenarios, and reload custom reference material at any time.
+
+### Setting interview prep context
+
+Use the **Interview Prep** panel in the left sidebar to teach the assistant about the scenario you are preparing for. Fill in the interview type, target role, company, and optional focus areas or success criteria, then click **Apply prep context**. The current chat (and any new chats you create) will:
+
+- Inject that context into the system prompt sent to the model
+- Number each interviewer question in the transcript for easy reference
+- Format every answer with a headline summary, supporting evidence, improvement/risks, and suggested follow-ups
+
+Each chat remembers the prep notes that were active when it was created, so you can maintain separate workspaces for different roles or companies.
 
 ### Connecting your ChatGPT account
 
