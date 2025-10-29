@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import sys
 import threading
 import uuid
@@ -793,10 +794,64 @@ class MainWindow(QMainWindow):
     def _format_structured_answer(self, index: int, question: str, answer: str) -> str:
         heading = f"Q{index}: {question.strip()}"
         divider = "-" * min(len(heading), 80)
-        body = answer.strip()
-        if not body:
-            return heading
-        return f"{heading}\n{divider}\n{body}"
+        sections = self._parse_structured_sections(answer)
+        lines: List[str] = [heading, divider, "Headline Summary:"]
+        lines.extend(self._format_section_lines(sections["headline"], bullet=False))
+        lines.append("")
+        lines.append("Supporting Evidence:")
+        lines.extend(self._format_section_lines(sections["evidence"], bullet=True))
+        lines.append("")
+        lines.append("Improvement & Risks:")
+        lines.extend(self._format_section_lines(sections["risks"], bullet=True))
+        lines.append("")
+        lines.append("Follow-up Suggestions:")
+        lines.extend(self._format_section_lines(sections["follow_up"], bullet=True))
+        return "\n".join(lines).strip()
+
+    def _parse_structured_sections(self, answer: str) -> Dict[str, List[str]]:
+        keys = {"headline": [], "evidence": [], "risks": [], "follow_up": []}
+        if not answer.strip():
+            return keys
+
+        section_aliases = {
+            "headline": ["headline summary", "summary", "answer"],
+            "evidence": ["supporting evidence", "evidence", "details", "support"],
+            "risks": ["improvement", "risks", "gaps", "lessons"],
+            "follow_up": ["follow-up", "follow up", "next steps", "followups"],
+        }
+
+        current_key = "headline"
+        for raw_line in answer.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            normalised = re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+            matched_key = None
+            for key, aliases in section_aliases.items():
+                if any(normalised.startswith(alias) for alias in aliases):
+                    matched_key = key
+                    break
+            if matched_key:
+                current_key = matched_key
+                continue
+            keys.setdefault(current_key, []).append(line)
+
+        return keys
+
+    def _format_section_lines(self, lines: List[str], bullet: bool) -> List[str]:
+        if not lines:
+            return ["(not captured)"]
+
+        formatted: List[str] = []
+        for line in lines:
+            cleaned = re.sub(r"^[\-•\d\.\)\s]+", "", line).strip()
+            if not cleaned:
+                continue
+            if bullet:
+                formatted.append(f"- {cleaned}")
+            else:
+                formatted.append(cleaned)
+        return formatted or ["(not captured)"]
 
     def _ensure_client(self) -> AIClient:
         if not self.ai_client:
