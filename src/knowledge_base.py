@@ -4,11 +4,12 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence
 
 import numpy as np
 
-from .openai_client import AIClient
+if TYPE_CHECKING:  # pragma: no cover - import for type checking only
+    from .openai_client import AIClient
 
 
 @dataclass
@@ -16,6 +17,7 @@ class KnowledgeChunk:
     content: str
     source: str
     embedding: np.ndarray
+    session_id: Optional[str]
 
 
 class KnowledgeBase:
@@ -31,13 +33,17 @@ class KnowledgeBase:
         self.chunk_char_length = chunk_char_length
         self.chunk_overlap = chunk_overlap
         self._chunks: List[KnowledgeChunk] = []
+        self._session_sources: dict[Optional[str], set[str]] = {}
         self._lock = threading.Lock()
 
     def clear(self) -> None:
         with self._lock:
             self._chunks.clear()
+            self._session_sources.clear()
 
-    def ingest_files(self, file_paths: Iterable[Path]) -> int:
+    def ingest_files(
+        self, file_paths: Iterable[Path], session_id: Optional[str] = None
+    ) -> int:
         """Load text from paths, embed, and store in memory.
 
         Returns the number of chunks added.
@@ -66,33 +72,69 @@ class KnowledgeBase:
         with self._lock:
             for content, source, embedding in zip(texts, sources, embeddings):
                 self._chunks.append(
-                    KnowledgeChunk(content=content, source=source, embedding=np.array(embedding))
+                    KnowledgeChunk(
+                        content=content,
+                        source=source,
+                        embedding=np.array(embedding),
+                        session_id=session_id,
+                    )
                 )
-
+                self._session_sources.setdefault(session_id, set()).add(source)
             return len(texts)
 
     def is_empty(self) -> bool:
         with self._lock:
             return not self._chunks
 
-    def top_matches(self, query: str, top_k: int = 4) -> List[str]:
+    def is_empty_for_session(self, session_id: Optional[str]) -> bool:
+        with self._lock:
+            return not any(chunk.session_id == session_id for chunk in self._chunks)
+
+    def top_matches(
+        self,
+        query: str,
+        top_k: int = 4,
+        session_id: Optional[str] = None,
+        include_global: bool = True,
+    ) -> List[str]:
         if not query.strip():
             return []
 
         with self._lock:
             if not self._chunks:
                 return []
-            chunk_embeddings = np.stack([chunk.embedding for chunk in self._chunks])
-            chunk_contents = [chunk.content for chunk in self._chunks]
+            filtered_chunks: List[KnowledgeChunk] = []
+            for chunk in self._chunks:
+                if chunk.session_id == session_id:
+                    filtered_chunks.append(chunk)
+                elif include_global and chunk.session_id is None:
+                    filtered_chunks.append(chunk)
+
+            if not filtered_chunks:
+                return []
+
+            chunk_embeddings = np.stack([chunk.embedding for chunk in filtered_chunks])
+            chunk_contents = [chunk.content for chunk in filtered_chunks]
 
         query_embedding = np.array(self.ai_client.embed_texts([query])[0])
         scores = self._cosine_similarity(query_embedding, chunk_embeddings)
         top_indices = scores.argsort()[::-1][:top_k]
         return [chunk_contents[idx] for idx in top_indices]
 
-    def listed_sources(self) -> List[str]:
+    def listed_sources(
+        self, session_id: Optional[str] = None, include_global: bool = True
+    ) -> List[str]:
         with self._lock:
-            return sorted({chunk.source for chunk in self._chunks})
+            sources: set[str] = set()
+            if include_global and None in self._session_sources:
+                sources.update(self._session_sources[None])
+            if session_id in self._session_sources:
+                sources.update(self._session_sources[session_id])
+        return sorted(sources)
+
+    def sessions_with_content(self) -> Sequence[Optional[str]]:
+        with self._lock:
+            return tuple(self._session_sources.keys())
 
     def _chunk_text(self, text: str) -> List[str]:
         normalised = re.sub(r"\s+", " ", text.strip())
