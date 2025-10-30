@@ -82,6 +82,34 @@ class KnowledgeBase:
                 self._session_sources.setdefault(session_id, set()).add(source)
             return len(texts)
 
+    def upsert_session_pair(
+        self,
+        session_id: str,
+        turn_index: int,
+        question: str,
+        answer: str,
+    ) -> None:
+        question = question.strip()
+        answer = answer.strip()
+        if not question or not answer:
+            return
+
+        source_identifier = f"session::{session_id}::{turn_index}"
+        snippet = f"Question: {question}\nAnswer: {answer}"
+        embedding = np.array(self.ai_client.embed_texts([snippet])[0])
+
+        with self._lock:
+            self._remove_source_locked(source_identifier)
+            self._chunks.append(
+                KnowledgeChunk(
+                    content=snippet,
+                    source=source_identifier,
+                    embedding=embedding,
+                    session_id=session_id,
+                )
+            )
+            self._session_sources.setdefault(session_id, set()).add(source_identifier)
+
     def is_empty(self) -> bool:
         with self._lock:
             return not self._chunks
@@ -130,7 +158,7 @@ class KnowledgeBase:
                 sources.update(self._session_sources[None])
             if session_id in self._session_sources:
                 sources.update(self._session_sources[session_id])
-        return sorted(sources)
+        return sorted(self._format_source_label(source) for source in sources)
 
     def sessions_with_content(self) -> Sequence[Optional[str]]:
         with self._lock:
@@ -187,3 +215,20 @@ class KnowledgeBase:
         # Avoid division by zero
         denom = np.clip(vector_norm * matrix_norms, a_min=1e-12, a_max=None)
         return matrix @ vector / denom
+
+    def _remove_source_locked(self, source_identifier: str) -> None:
+        if not source_identifier:
+            return
+        self._chunks = [chunk for chunk in self._chunks if chunk.source != source_identifier]
+        for sources in self._session_sources.values():
+            sources.discard(source_identifier)
+
+    @staticmethod
+    def _format_source_label(source: str) -> str:
+        if source.startswith("session::"):
+            parts = source.split("::")
+            if len(parts) == 3:
+                session_fragment = parts[1][:8]
+                turn_label = parts[2]
+                return f"Session {session_fragment} — turn {turn_label}"
+        return source

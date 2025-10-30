@@ -17,7 +17,7 @@ class Settings:
     transcription_model: str = "whisper-1"
     embedding_model: str = "text-embedding-3-small"
     sample_rate: int = 16000
-    chunk_duration: float = 1.5
+    chunk_duration: float = 1.0
     chatgpt_access_token: Optional[str] = None
     chatgpt_bearer_token: Optional[str] = None
     chatgpt_base_url: str = "https://chat.openai.com/backend-api"

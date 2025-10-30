@@ -6,9 +6,11 @@ import re
 import sys
 import threading
 import uuid
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor, QPalette
@@ -33,7 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .audio_capture import MicrophoneListener
+from .audio_capture import AudioChunk, MicrophoneListener
 from .chatgpt_sync import ChatGPTSync, ChatGPTSyncError
 from .chatgpt_share import ChatGPTShareError, ChatGPTShareImporter, SharedChat
 from .config import Settings, get_settings
@@ -127,7 +129,14 @@ class ChatSession:
 
 
 class SessionSwitchBridge(QObject):
-    requested = pyqtSignal(str, object, str)
+    requested = pyqtSignal(str, object, str, str)
+
+
+@dataclass
+class PendingTranscription:
+    sequence: int
+    chunk: AudioChunk
+    future: Future[str]
 
 
 class TranscriptionWorker(QObject):
@@ -147,6 +156,8 @@ class TranscriptionWorker(QObject):
         transcript_text: str,
         parent: Optional[QObject] = None,
         chunk_duration: float = 1.0,
+        prep_summary: str = "",
+        max_workers: int = 2,
     ) -> None:
         super().__init__(parent)
         self.audio_queue = audio_queue
@@ -158,59 +169,49 @@ class TranscriptionWorker(QObject):
         ]
         self._stop_event = threading.Event()
         self._previous_transcript = transcript_text
-        min_silence = max(chunk_duration * 0.6, 0.5)
+        min_silence = max(chunk_duration * 0.6, 0.4)
         self._question_detector = QuestionBoundaryDetector(min_silence_seconds=min_silence)
+        self.prep_summary = prep_summary.strip()
+        self._executor = ThreadPoolExecutor(max_workers=max(1, max_workers))
+        self._pending: Deque[PendingTranscription] = deque()
+        self._sequence = 0
+        self._silence_floor = 0.006
+        self._transcription_hint = ""
 
     @pyqtSlot()
     def run(self) -> None:
         self.status_changed.emit("Listening…")
-        while not self._stop_event.is_set():
-            try:
-                chunk = self.audio_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            try:
-                self.status_changed.emit("Transcribing…")
-                transcript = self.ai_client.transcribe(chunk)
-                addition = self._extract_new_text(transcript)
-                question_text = self._question_detector.observe(chunk, addition)
-
-                if addition:
-                    self.transcript_ready.emit(self.session_id, addition)
-
-                if not question_text:
-                    self.status_changed.emit("Listening…")
+        try:
+            while not self._stop_event.is_set():
+                self._drain_pending()
+                try:
+                    chunk = self.audio_queue.get(timeout=0.2)
+                except queue.Empty:
                     continue
 
-                user_message = question_text
-                self._append_conversation({"role": "user", "content": user_message})
-                self.user_message_committed.emit(self.session_id, user_message)
+                if chunk.rms < self._silence_floor and not self._question_detector.current_text:
+                    self._question_detector.observe(chunk, "")
+                    continue
 
-                context: List[str] = []
-                if self.knowledge_base and not self.knowledge_base.is_empty():
-                    context = self.knowledge_base.top_matches(
-                        user_message, session_id=self.session_id
-                    )
-
-                self.status_changed.emit("Thinking…")
-                response = self.ai_client.chat_completion(self._conversation, context).strip()
-                if response:
-                    self._append_conversation({"role": "assistant", "content": response})
-                    self.assistant_ready.emit(self.session_id, response)
-                self.status_changed.emit("Listening…")
-            except Exception as exc:  # pragma: no cover - runtime safeguard
-                self.error_occurred.emit(str(exc))
-                self.status_changed.emit("Error")
-
-        self.status_changed.emit("Idle")
+                self.status_changed.emit("Transcribing…")
+                self._submit_transcription(chunk)
+            self._drain_pending(final=True)
+        except Exception as exc:  # pragma: no cover - runtime safeguard
+            self.error_occurred.emit(str(exc))
+            self.status_changed.emit("Error")
+        finally:
+            self.status_changed.emit("Idle")
 
     def stop(self) -> None:
         self._stop_event.set()
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
 
-    @pyqtSlot(str, object, str)
+    @pyqtSlot(str, object, str, str)
     def switch_session(
-        self, session_id: str, conversation: object, transcript_text: str
+        self, session_id: str, conversation: object, transcript_text: str, prep_summary: str
     ) -> None:
         self.session_id = session_id
         if isinstance(conversation, list):
@@ -223,6 +224,11 @@ class TranscriptionWorker(QObject):
             self._conversation = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
         self._previous_transcript = transcript_text
         self._question_detector.reset()
+        self.prep_summary = prep_summary.strip()
+        while self._pending:
+            pending = self._pending.popleft()
+            pending.future.cancel()
+        self._transcription_hint = ""
 
     def _extract_new_text(self, transcript: str) -> str:
         cleaned = transcript.strip()
@@ -252,6 +258,109 @@ class TranscriptionWorker(QObject):
             system_message = self._conversation[0]
             recent_messages = self._conversation[-49:]
             self._conversation = [system_message, *recent_messages]
+
+    def _submit_transcription(self, chunk: AudioChunk) -> None:
+        prompt = self._compose_transcription_prompt()
+        future = self._executor.submit(
+            self.ai_client.transcribe,
+            chunk,
+            prompt=prompt or None,
+        )
+        self._pending.append(
+            PendingTranscription(sequence=self._sequence, chunk=chunk, future=future)
+        )
+        self._sequence += 1
+
+    def _drain_pending(self, final: bool = False) -> None:
+        while self._pending:
+            pending = self._pending[0]
+            if not pending.future.done():
+                if final:
+                    pending.future.cancel()
+                    self._pending.popleft()
+                    continue
+                break
+
+            self._pending.popleft()
+            try:
+                transcript = pending.future.result()
+            except Exception as exc:
+                self.error_occurred.emit(str(exc))
+                self.status_changed.emit("Error")
+                continue
+
+            addition = self._extract_new_text(transcript)
+            if addition:
+                self.transcript_ready.emit(self.session_id, addition)
+
+            question_text = self._question_detector.observe(pending.chunk, addition)
+            if addition:
+                self._transcription_hint = self._question_detector.current_text
+
+            if not question_text:
+                self.status_changed.emit("Listening…")
+                continue
+
+            self._handle_question(question_text)
+
+    def _handle_question(self, user_message: str) -> None:
+        self._append_conversation({"role": "user", "content": user_message})
+        self.user_message_committed.emit(self.session_id, user_message)
+
+        context: List[str] = []
+        if self.knowledge_base and not self.knowledge_base.is_empty():
+            context = self.knowledge_base.top_matches(
+                user_message, session_id=self.session_id
+            )
+
+        self.status_changed.emit("Thinking…")
+        try:
+            sections = self.ai_client.generate_carl_sections(
+                self._conversation,
+                context,
+                prep_summary=self.prep_summary,
+            )
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+            self.status_changed.emit("Error")
+            return
+
+        response = self._sections_to_text(sections)
+        self._append_conversation({"role": "assistant", "content": response})
+        self.assistant_ready.emit(self.session_id, response)
+        self.status_changed.emit("Listening…")
+        self._transcription_hint = ""
+
+    def _compose_transcription_prompt(self) -> str:
+        hints: List[str] = []
+        if self.prep_summary:
+            hints.append(self.prep_summary)
+        if self._transcription_hint:
+            hints.append(f"Question so far: {self._transcription_hint}")
+        prompt = " | ".join(hints).strip()
+        return prompt[-400:] if len(prompt) > 400 else prompt
+
+    def _sections_to_text(self, sections: Dict[str, List[str]]) -> str:
+        def clean(items: List[str]) -> List[str]:
+            return [item.strip() for item in items if item and item.strip()]
+
+        context_lines = clean(sections.get("context", []))
+        actions = clean(sections.get("actions", []))
+        results = clean(sections.get("results", []))
+        learnings = clean(sections.get("learnings", []))
+
+        lines: List[str] = ["Context:"]
+        lines.extend(context_lines)
+        lines.append("")
+        lines.append("Actions:")
+        lines.extend(f"- {item}" for item in actions)
+        lines.append("")
+        lines.append("Results:")
+        lines.extend(f"- {item}" for item in results)
+        lines.append("")
+        lines.append("Learnings:")
+        lines.extend(f"- {item}" for item in learnings)
+        return "\n".join(lines).strip()
 
 
 class MainWindow(QMainWindow):
@@ -535,6 +644,7 @@ class MainWindow(QMainWindow):
                     session.session_id,
                     list(session.conversation),
                     session.last_transcript_segment,
+                    self.prep_profile.description(),
                 )
 
             if session.prep_notes:
@@ -704,10 +814,13 @@ class MainWindow(QMainWindow):
                             fallback_sections,
                         )
                     )
+                self._upsert_session_pair(session, len(session.qa_pairs))
             else:
                 session.transcript_segments.append(content)
                 session.transcript_questions.append(content)
                 session.qa_pairs.append(QAPair(question=content))
+
+        self._update_kb_status(session.session_id)
 
     def _create_session_from_chatgpt(
         self,
@@ -778,6 +891,8 @@ class MainWindow(QMainWindow):
             list(session.conversation),
             session.last_transcript_segment,
             chunk_duration=self.settings.chunk_duration,
+            prep_summary=self.prep_profile.description(),
+            max_workers=2,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -796,6 +911,7 @@ class MainWindow(QMainWindow):
             session.session_id,
             list(session.conversation),
             session.last_transcript_segment,
+            self.prep_profile.description(),
         )
 
         self.listener.start()
@@ -881,6 +997,7 @@ class MainWindow(QMainWindow):
         session.assistant_display_segments.append(formatted_text)
         session.assistant_display_html_segments.append(formatted_html)
         self._trim_session_history(session)
+        self._upsert_session_pair(session, response_index)
 
         if session_id == self.current_session_id:
             self._render_assistant_view(session)
@@ -888,6 +1005,28 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _handle_worker_error(self, message: str) -> None:
         QMessageBox.critical(self, "Assistant Error", message)
+
+    def _upsert_session_pair(self, session: ChatSession, index: int) -> None:
+        if not self.knowledge_base:
+            return
+        if index <= 0 or index > len(session.qa_pairs):
+            return
+        pair = session.qa_pairs[index - 1]
+        question = pair.question.strip()
+        answer = pair.answer.strip()
+        if not question or not answer:
+            return
+        try:
+            self.knowledge_base.upsert_session_pair(
+                session.session_id,
+                index,
+                question,
+                answer,
+            )
+        except Exception as exc:  # pragma: no cover - defensive feedback
+            self.status_label.setText(f"Knowledge indexing failed: {exc}")
+        else:
+            self._update_kb_status(session.session_id)
 
     def _auto_scroll(self, widget: QTextBrowser) -> None:
         widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
@@ -1228,6 +1367,7 @@ class MainWindow(QMainWindow):
                 session.session_id,
                 list(session.conversation),
                 session.last_transcript_segment,
+                self.prep_profile.description(),
             )
 
     def _render_session(self, session: ChatSession) -> None:

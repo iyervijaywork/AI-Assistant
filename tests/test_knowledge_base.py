@@ -57,3 +57,28 @@ def test_session_specific_matches(tmp_path):
 
     assert not kb.is_empty_for_session(session_one)
     assert not kb.is_empty_for_session(None)
+
+
+def test_upsert_session_pair_overwrites_previous():
+    ai_client = DummyAIClient()
+    kb = KnowledgeBase(ai_client)
+
+    session_id = "session-xyz"
+    kb.upsert_session_pair(session_id, 1, "Tell me about migration", "I led a migration.")
+    first_match = kb.top_matches("migration", session_id=session_id)
+    assert first_match, "Expected the session pair to be indexed"
+    assert "migration" in first_match[0].lower()
+
+    kb.upsert_session_pair(
+        session_id,
+        1,
+        "Tell me about migration",
+        "I led a migration that scaled to millions of users.",
+    )
+
+    updated_match = kb.top_matches("scaled", session_id=session_id)
+    assert updated_match, "Expected the updated session pair to be retrievable"
+    assert "millions" in updated_match[0].lower()
+
+    sources = kb.listed_sources(session_id=session_id)
+    assert any("turn 1" in source for source in sources)

@@ -64,4 +64,9 @@ def test_transcript_and_response_flow():
     assert "I led" in session.assistant_segments[-1]
     assert "context" in window.assistant_view.toHtml().lower()
 
+    kb = window.knowledge_base
+    assert kb is not None
+    matches = kb.top_matches("war room", session_id=session_id)
+    assert matches and "war room" in matches[0].lower()
+
     window.close()
