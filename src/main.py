@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -34,9 +35,11 @@ from PyQt6.QtWidgets import (
 
 from .audio_capture import MicrophoneListener
 from .chatgpt_sync import ChatGPTSync, ChatGPTSyncError
+from .chatgpt_share import ChatGPTShareError, ChatGPTShareImporter, SharedChat
 from .config import Settings, get_settings
 from .knowledge_base import KnowledgeBase
 from .openai_client import AIClient, DEFAULT_SYSTEM_PROMPT
+from .question_detection import QuestionBoundaryDetector
 
 
 @dataclass
@@ -89,6 +92,7 @@ class ChatSession:
     qa_pairs: List[QAPair] = field(default_factory=list)
     prep_notes: str = ""
     chatgpt_conversation_id: Optional[str] = None
+    chatgpt_share_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.conversation:
@@ -142,6 +146,7 @@ class TranscriptionWorker(QObject):
         conversation: List[dict[str, str]],
         transcript_text: str,
         parent: Optional[QObject] = None,
+        chunk_duration: float = 1.0,
     ) -> None:
         super().__init__(parent)
         self.audio_queue = audio_queue
@@ -153,7 +158,8 @@ class TranscriptionWorker(QObject):
         ]
         self._stop_event = threading.Event()
         self._previous_transcript = transcript_text
-        self._user_buffer = ""
+        min_silence = max(chunk_duration * 0.6, 0.5)
+        self._question_detector = QuestionBoundaryDetector(min_silence_seconds=min_silence)
 
     @pyqtSlot()
     def run(self) -> None:
@@ -168,19 +174,16 @@ class TranscriptionWorker(QObject):
                 self.status_changed.emit("Transcribing…")
                 transcript = self.ai_client.transcribe(chunk)
                 addition = self._extract_new_text(transcript)
-                if not addition:
+                question_text = self._question_detector.observe(chunk, addition)
+
+                if addition:
+                    self.transcript_ready.emit(self.session_id, addition)
+
+                if not question_text:
                     self.status_changed.emit("Listening…")
                     continue
 
-                self.transcript_ready.emit(self.session_id, addition)
-                self._user_buffer = (self._user_buffer + " " + addition).strip()
-
-                if not self._should_respond(self._user_buffer):
-                    self.status_changed.emit("Listening…")
-                    continue
-
-                user_message = self._user_buffer
-                self._user_buffer = ""
+                user_message = question_text
                 self._append_conversation({"role": "user", "content": user_message})
                 self.user_message_committed.emit(self.session_id, user_message)
 
@@ -219,14 +222,7 @@ class TranscriptionWorker(QObject):
         else:
             self._conversation = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
         self._previous_transcript = transcript_text
-        self._user_buffer = ""
-
-    def _should_respond(self, buffer: str) -> bool:
-        if not buffer:
-            return False
-        if any(buffer.endswith(punct) for punct in (".", "?", "!")):
-            return True
-        return len(buffer.split()) >= 12
+        self._question_detector.reset()
 
     def _extract_new_text(self, transcript: str) -> str:
         cleaned = transcript.strip()
@@ -268,6 +264,7 @@ class MainWindow(QMainWindow):
         self.ai_client: Optional[AIClient] = None
         self.knowledge_base: Optional[KnowledgeBase] = None
         self.chatgpt_sync: Optional[ChatGPTSync] = None
+        self.chatgpt_share_importer: Optional[ChatGPTShareImporter] = ChatGPTShareImporter()
         self.listener: Optional[MicrophoneListener] = None
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[TranscriptionWorker] = None
@@ -275,6 +272,7 @@ class MainWindow(QMainWindow):
 
         self.sessions: Dict[str, ChatSession] = {}
         self.chatgpt_session_map: Dict[str, str] = {}
+        self.chatgpt_share_map: Dict[str, str] = {}
         self.current_session_id: Optional[str] = None
         self.prep_profile: PreparationProfile = PreparationProfile()
 
@@ -376,6 +374,10 @@ class MainWindow(QMainWindow):
         self.sync_button.clicked.connect(self._on_sync_chatgpt)
         buttons_layout.addWidget(self.sync_button)
 
+        self.import_share_button = QPushButton("Import shared project…")
+        self.import_share_button.clicked.connect(self._on_import_chatgpt_share)
+        buttons_layout.addWidget(self.import_share_button)
+
         load_button = QPushButton("Load reference files…")
         load_button.clicked.connect(self._load_reference_material)
         buttons_layout.addWidget(load_button)
@@ -467,12 +469,12 @@ class MainWindow(QMainWindow):
         profile = profile or self.prep_profile
         base_prompt = DEFAULT_SYSTEM_PROMPT
         structure_prompt = (
-            "Always deliver structured interview answers using this outline:\n"
-            "1. Headline Summary — one sentence that directly answers the question.\n"
-            "2. Supporting Evidence — 2-4 bullet points with metrics, STAR stories, or examples.\n"
-            "3. Improvement & Risks — candid reflections on gaps, trade-offs, or lessons.\n"
-            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer.\n"
-            "Speak in the first person as the candidate, stay concise and confident, and avoid filler."
+            "Respond as the candidate in the first person using the CARL framework:\n"
+            "1. Context — describe the situation, stakeholders, and objectives in one tight paragraph.\n"
+            "2. Actions — list 2-4 decisive steps you personally drove, highlighting collaboration and reasoning.\n"
+            "3. Results — quantify the impact with metrics or concrete outcomes that matter to the interviewer.\n"
+            "4. Learnings — close with one or two reflective insights or forward-looking adjustments.\n"
+            "Stay focused, avoid filler, and mirror the interviewer's terminology when appropriate."
         )
 
         context_lines = profile.summary_lines()
@@ -492,6 +494,8 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.ai_client = AIClient(settings)
         self.knowledge_base = KnowledgeBase(self.ai_client)
+        base_origin = settings.chatgpt_base_url.split("/backend-api")[0]
+        self.chatgpt_share_importer = ChatGPTShareImporter(base_url=base_origin)
 
         if settings.chatgpt_access_token:
             self.chatgpt_sync = ChatGPTSync(
@@ -587,6 +591,69 @@ class MainWindow(QMainWindow):
                 "Imported the latest conversations from your ChatGPT account.",
             )
 
+    def _on_import_chatgpt_share(self) -> None:
+        url, accepted = QInputDialog.getText(
+            self,
+            "Import ChatGPT shared project",
+            "Paste the ChatGPT share link:",
+        )
+        if not accepted or not url.strip():
+            return
+
+        importer = self.chatgpt_share_importer or ChatGPTShareImporter()
+        try:
+            shared = importer.fetch(url.strip())
+        except ChatGPTShareError as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+
+        self._import_shared_chat(shared)
+
+    def _import_shared_chat(self, shared: SharedChat) -> None:
+        existing_session_id = self.chatgpt_share_map.get(shared.share_id)
+        if existing_session_id and existing_session_id in self.sessions:
+            session = self.sessions[existing_session_id]
+            self._apply_messages_to_session(session, shared.messages, shared.title)
+            session.chatgpt_share_id = shared.share_id
+            self._update_session_item_title(session.session_id, session.title)
+            self._select_session_in_list(session.session_id)
+            QMessageBox.information(
+                self,
+                "Shared project refreshed",
+                "Updated the imported ChatGPT project with the latest content.",
+            )
+            return
+
+        system_message = (
+            dict(self.ai_client.system_message)
+            if self.ai_client
+            else {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
+        )
+        session = ChatSession(
+            session_id=str(uuid.uuid4()),
+            title=shared.title or "Shared ChatGPT project",
+            system_prompt=system_message.get("content", DEFAULT_SYSTEM_PROMPT),
+            chatgpt_share_id=shared.share_id,
+        )
+        self._apply_messages_to_session(session, shared.messages, session.title)
+        self.chatgpt_share_map[shared.share_id] = session.session_id
+        self._register_session(session, make_current=True)
+        QMessageBox.information(
+            self,
+            "Shared project imported",
+            "Loaded the shared ChatGPT project into a new interview session.",
+        )
+
+    def _select_session_in_list(self, session_id: str) -> None:
+        for index in range(self.session_list.count()):
+            item = self.session_list.item(index)
+            if not item:
+                continue
+            item_id = item.data(Qt.ItemDataRole.UserRole)
+            if item_id and str(item_id) == session_id:
+                self.session_list.setCurrentItem(item)
+                break
+
     def _apply_messages_to_session(
         self, session: ChatSession, messages: List[dict[str, str]], title: str
     ) -> None:
@@ -617,13 +684,26 @@ class MainWindow(QMainWindow):
                 session.assistant_segments.append(content)
                 if session.qa_pairs:
                     session.qa_pairs[-1].answer = content
-                    session.assistant_display_segments.append(
-                        self._format_structured_answer(
-                            len(session.qa_pairs), session.qa_pairs[-1].question, content
-                        )
+                    formatted_text, formatted_html = self._format_structured_answer_assets(
+                        len(session.qa_pairs), session.qa_pairs[-1].question, content
                     )
+                    session.assistant_display_segments.append(formatted_text)
+                    session.assistant_display_html_segments.append(formatted_html)
                 else:
                     session.assistant_display_segments.append(content)
+                    fallback_sections = {
+                        "context": [content],
+                        "actions": [],
+                        "results": [],
+                        "learnings": [],
+                    }
+                    session.assistant_display_html_segments.append(
+                        self._assistant_card_html(
+                            len(session.assistant_display_segments),
+                            "Assistant Response",
+                            fallback_sections,
+                        )
+                    )
             else:
                 session.transcript_segments.append(content)
                 session.transcript_questions.append(content)
@@ -697,6 +777,7 @@ class MainWindow(QMainWindow):
             session.session_id,
             list(session.conversation),
             session.last_transcript_segment,
+            chunk_duration=self.settings.chunk_duration,
         )
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.started.connect(self.worker.run)
@@ -875,28 +956,28 @@ class MainWindow(QMainWindow):
         self, index: int, question: str, sections: Dict[str, List[str]]
     ) -> str:
         safe_question = html.escape(question.strip()) if question.strip() else "Interview question"
-        headline_html = self._format_section_html(sections["headline"], bullet=False)
-        evidence_html = self._format_section_html(sections["evidence"], bullet=True)
-        risks_html = self._format_section_html(sections["risks"], bullet=True)
-        follow_html = self._format_section_html(sections["follow_up"], bullet=True)
+        context_html = self._format_section_html(sections["context"], bullet=False)
+        actions_html = self._format_section_html(sections["actions"], bullet=True)
+        results_html = self._format_section_html(sections["results"], bullet=True)
+        learnings_html = self._format_section_html(sections["learnings"], bullet=True)
         return (
             "<div class='card assistant-card'>"
             f"  <div class='card-title'>Q{index} · {safe_question}</div>"
             "  <div class='assistant-section'>"
-            "    <h4>Headline Summary</h4>"
-            f"    {headline_html}"
+            "    <h4>Context</h4>"
+            f"    {context_html}"
             "  </div>"
             "  <div class='assistant-section'>"
-            "    <h4>Supporting Evidence</h4>"
-            f"    {evidence_html}"
+            "    <h4>Actions</h4>"
+            f"    {actions_html}"
             "  </div>"
             "  <div class='assistant-section'>"
-            "    <h4>Improvement &amp; Risks</h4>"
-            f"    {risks_html}"
+            "    <h4>Results</h4>"
+            f"    {results_html}"
             "  </div>"
             "  <div class='assistant-section'>"
-            "    <h4>Follow-up Suggestions</h4>"
-            f"    {follow_html}"
+            "    <h4>Learnings</h4>"
+            f"    {learnings_html}"
             "  </div>"
             "</div>"
         )
@@ -1014,40 +1095,44 @@ class MainWindow(QMainWindow):
             "</body></html>"
         )
 
+    def _format_structured_answer(self, index: int, question: str, answer: str) -> str:
+        formatted_text, _ = self._format_structured_answer_assets(index, question, answer)
+        return formatted_text
+
     def _format_structured_answer_assets(
         self, index: int, question: str, answer: str
     ) -> tuple[str, str]:
         sections = self._parse_structured_sections(answer)
         heading = f"Q{index}: {question.strip()}" if question.strip() else f"Q{index}"
         divider = "-" * min(len(heading), 80)
-        lines: List[str] = [heading, divider, "Headline Summary:"]
-        lines.extend(self._format_section_lines(sections["headline"], bullet=False))
+        lines: List[str] = [heading, divider, "Context:"]
+        lines.extend(self._format_section_lines(sections["context"], bullet=False))
         lines.append("")
-        lines.append("Supporting Evidence:")
-        lines.extend(self._format_section_lines(sections["evidence"], bullet=True))
+        lines.append("Actions:")
+        lines.extend(self._format_section_lines(sections["actions"], bullet=True))
         lines.append("")
-        lines.append("Improvement & Risks:")
-        lines.extend(self._format_section_lines(sections["risks"], bullet=True))
+        lines.append("Results:")
+        lines.extend(self._format_section_lines(sections["results"], bullet=True))
         lines.append("")
-        lines.append("Follow-up Suggestions:")
-        lines.extend(self._format_section_lines(sections["follow_up"], bullet=True))
+        lines.append("Learnings:")
+        lines.extend(self._format_section_lines(sections["learnings"], bullet=True))
         text_answer = "\n".join(lines).strip()
         html_answer = self._assistant_card_html(index, question, sections)
         return text_answer, html_answer
 
     def _parse_structured_sections(self, answer: str) -> Dict[str, List[str]]:
-        keys = {"headline": [], "evidence": [], "risks": [], "follow_up": []}
+        keys = {"context": [], "actions": [], "results": [], "learnings": []}
         if not answer.strip():
             return keys
 
         section_aliases = {
-            "headline": ["headline summary", "summary", "answer"],
-            "evidence": ["supporting evidence", "evidence", "details", "support"],
-            "risks": ["improvement", "risks", "gaps", "lessons"],
-            "follow_up": ["follow-up", "follow up", "next steps", "followups"],
+            "context": ["context", "situation", "background"],
+            "actions": ["actions", "steps", "what i did", "approach"],
+            "results": ["results", "outcome", "impact", "metrics"],
+            "learnings": ["learnings", "lessons", "takeaways", "insights"],
         }
 
-        current_key = "headline"
+        current_key = "context"
         for raw_line in answer.splitlines():
             line = raw_line.strip()
             if not line:

@@ -22,6 +22,8 @@ class AudioChunk:
     data: np.ndarray
     sample_rate: int
     timestamp: float
+    rms: float
+    duration: float
 
     def to_wav_bytes(self) -> bytes:
         """Convert the chunk to 16-bit PCM WAV bytes."""
@@ -93,10 +95,14 @@ class MicrophoneListener:
             while len(buffer) >= frames_per_chunk:
                 chunk_data = buffer[:frames_per_chunk]
                 buffer = buffer[frames_per_chunk:]
+                rms = float(np.sqrt(np.mean(np.square(chunk_data)))) if len(chunk_data) else 0.0
+                duration = float(len(chunk_data)) / float(self.sample_rate)
                 chunk = AudioChunk(
                     data=chunk_data.copy(),
                     sample_rate=self.sample_rate,
                     timestamp=time.time(),
+                    rms=rms,
+                    duration=duration,
                 )
                 self._audio_queue.put(chunk)
                 if self.callback:

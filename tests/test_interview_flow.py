@@ -48,20 +48,20 @@ def test_transcript_and_response_flow():
     assert session.qa_pairs[-1].question == question
 
     answer = (
-        "Headline Summary: I led our data migration under a four-week deadline.\n"
-        "Supporting Evidence:\n"
+        "Context: I led our data migration under a four-week deadline.\n"
+        "Actions:\n"
         "- I created a war room with engineering, QA, and analytics to unblock issues daily.\n"
         "- I negotiated phased rollouts with the business to keep customer impact at zero.\n"
-        "Improvement & Risks:\n"
-        "- I would automate more validation to catch regressions faster next time.\n"
-        "Follow-up Suggestions:\n"
-        "- I can share how we tracked morale and burn-down metrics in detail."
+        "Results:\n"
+        "- We migrated 42 services with zero severity-one incidents and hit our launch date.\n"
+        "Learnings:\n"
+        "- I would automate more validation to catch regressions faster next time."
     )
     window._append_assistant(session_id, answer)
 
-    assert session.qa_pairs[-1].answer.startswith("Headline Summary")
+    assert session.qa_pairs[-1].answer.startswith("Context")
     assert "Q1" in session.assistant_html
     assert "I led" in session.assistant_segments[-1]
-    assert "war room" in window.assistant_view.toHtml().lower()
+    assert "context" in window.assistant_view.toHtml().lower()
 
     window.close()
