@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 import requests
+
+
+UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 class ChatGPTShareError(RuntimeError):
@@ -40,20 +46,26 @@ class ChatGPTShareImporter:
         )
 
     def fetch(self, share_url: str) -> SharedChat:
-        share_id = self._extract_share_id(share_url)
+        share_url = share_url.strip()
+        parsed = urlparse(share_url)
+        share_id = self._extract_share_id(parsed)
         if not share_id:
             raise ChatGPTShareError("The provided link does not look like a ChatGPT share URL.")
 
-        payload = self._fetch_share_payload(share_id)
+        base_url = self._resolve_base_url(parsed)
+        payload = self._fetch_share_payload(share_id, base_url=base_url)
         mapping: Dict[str, Dict[str, object]] = payload.get("mapping", {})
         messages = self._parse_mapping(mapping)
         title = payload.get("title") or "Shared ChatGPT project"
         return SharedChat(share_id=share_id, title=title, messages=messages)
 
-    def _fetch_share_payload(self, share_id: str) -> Dict[str, object]:
+    def _fetch_share_payload(
+        self, share_id: str, *, base_url: Optional[str] = None
+    ) -> Dict[str, object]:
+        resolved_base = (base_url or self.base_url).rstrip("/")
         endpoints = [
-            f"{self.base_url}/backend-api/share/{share_id}",
-            f"{self.base_url}/backend-api/share/{share_id}/conversation",
+            f"{resolved_base}/backend-api/share/{share_id}",
+            f"{resolved_base}/backend-api/share/{share_id}/conversation",
         ]
         last_error: Optional[str] = None
         for endpoint in endpoints:
@@ -129,14 +141,39 @@ class ChatGPTShareImporter:
         ordered = [{"role": msg["role"], "content": msg["content"]} for msg in messages]
         return ordered
 
-    def _extract_share_id(self, share_url: str) -> Optional[str]:
-        parsed = urlparse(share_url.strip())
+    def _extract_share_id(self, parsed: ParseResult) -> Optional[str]:
         path = parsed.path.strip("/")
-        if not path:
-            return None
-        parts = [segment for segment in path.split("/") if segment]
-        if not parts:
-            return None
-        if parts[0] != "share":
-            return None
-        return parts[-1]
+        segments = [segment for segment in path.split("/") if segment]
+        if segments:
+            lowered_first = segments[0].lower()
+            if lowered_first == "share" and len(segments) > 1:
+                candidate = segments[-1]
+                cleaned = candidate.split("?")[0].split("#")[0]
+                if cleaned:
+                    return cleaned
+            uuid_candidate = self._find_uuid_segment(reversed(segments))
+            if uuid_candidate:
+                return uuid_candidate
+
+        query_params = parse_qs(parsed.query)
+        for key in ("shareId", "conversationId", "id"):
+            for value in query_params.get(key, []):
+                if self._is_uuid(value):
+                    return value
+        return None
+
+    def _resolve_base_url(self, parsed: ParseResult) -> str:
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        return self.base_url
+
+    def _find_uuid_segment(self, segments: Iterable[str]) -> Optional[str]:
+        for segment in segments:
+            cleaned = segment.split("?")[0].split("#")[0]
+            if self._is_uuid(cleaned):
+                return cleaned
+        return None
+
+    @staticmethod
+    def _is_uuid(value: str) -> bool:
+        return bool(UUID_PATTERN.match(value.strip()))
