@@ -170,7 +170,8 @@ class ChatGPTSync:
         elif response.status_code == 401:
             raise ChatGPTSyncError(
                 "ChatGPT rejected the request using only the session cookie. "
-                "Provide a valid bearer token via CHATGPT_BEARER_TOKEN or refresh the session."
+                "Provide a valid bearer token via CHATGPT_BEARER_TOKEN or refresh the session. "
+                "Alternatively, import a shared project using the 'Import shared project…' option."
             )
         return response
 
