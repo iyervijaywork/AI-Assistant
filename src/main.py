@@ -186,7 +186,9 @@ class TranscriptionWorker(QObject):
 
                 context: List[str] = []
                 if self.knowledge_base and not self.knowledge_base.is_empty():
-                    context = self.knowledge_base.top_matches(user_message)
+                    context = self.knowledge_base.top_matches(
+                        user_message, session_id=self.session_id
+                    )
 
                 self.status_changed.emit("Thinking…")
                 response = self.ai_client.chat_completion(self._conversation, context).strip()
@@ -469,7 +471,8 @@ class MainWindow(QMainWindow):
             "1. Headline Summary — one sentence that directly answers the question.\n"
             "2. Supporting Evidence — 2-4 bullet points with metrics, STAR stories, or examples.\n"
             "3. Improvement & Risks — candid reflections on gaps, trade-offs, or lessons.\n"
-            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer."
+            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer.\n"
+            "Speak in the first person as the candidate, stay concise and confident, and avoid filler."
         )
 
         context_lines = profile.summary_lines()
@@ -1149,6 +1152,7 @@ class MainWindow(QMainWindow):
             self.prep_summary_label.setText(session.prep_notes)
         else:
             self._update_prep_summary_label()
+        self._update_kb_status(session.session_id)
 
     def _trim_session_history(self, session: ChatSession, max_turns: int = 20) -> None:
         if len(session.conversation) <= 1:
@@ -1176,8 +1180,13 @@ class MainWindow(QMainWindow):
         if not file_paths or not self.knowledge_base:
             return
 
+        session = self.sessions.get(self.current_session_id) if self.current_session_id else None
+        session_id = session.session_id if session else None
+
         try:
-            added_chunks = self.knowledge_base.ingest_files(Path(path) for path in file_paths)
+            added_chunks = self.knowledge_base.ingest_files(
+                (Path(path) for path in file_paths), session_id=session_id
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Import error", str(exc))
             return
@@ -1190,26 +1199,36 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._update_kb_status()
+        self._update_kb_status(session_id)
+        scope_message = (
+            "for this interview session."
+            if session_id
+            else "available to every session."
+        )
         QMessageBox.information(
             self,
             "Knowledge base updated",
-            f"Loaded {added_chunks} reference snippets from {len(file_paths)} files.",
+            (
+                "Loaded {chunks} reference snippets from {files} files "
+                f"{scope_message}"
+            ).format(chunks=added_chunks, files=len(file_paths)),
         )
 
-    def _update_kb_status(self) -> None:
+    def _update_kb_status(self, session_id: Optional[str] = None) -> None:
         if not self.knowledge_base or self.knowledge_base.is_empty():
             self.kb_status_label.setText("Knowledge base: empty")
             self.kb_status_label.setToolTip("")
             return
 
-        sources = self.knowledge_base.listed_sources()
+        sources = self.knowledge_base.listed_sources(session_id=session_id)
         if not sources:
             self.kb_status_label.setText("Knowledge base: ready")
             self.kb_status_label.setToolTip("")
             return
 
-        self.kb_status_label.setText(f"Knowledge base: {len(sources)} files")
+        self.kb_status_label.setText(
+            f"Knowledge base: {len(sources)} files for this session"
+        )
         self.kb_status_label.setToolTip("\n".join(sources))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
