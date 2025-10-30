@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
-import sounddevice as sd
+
+try:  # pragma: no cover - handled at runtime for environments without PortAudio
+    import sounddevice as sd
+except OSError as exc:  # pragma: no cover - fallback for CI environments
+    sd = None  # type: ignore[assignment]
+    _SOUNDDEVICE_ERROR = exc
+else:
+    _SOUNDDEVICE_ERROR = None
 
 
 @dataclass
@@ -46,9 +53,14 @@ class MicrophoneListener:
         self._audio_queue: "queue.Queue[AudioChunk]" = queue.Queue()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._stream: Optional[sd.InputStream] = None
+        self._stream: Optional["sd.InputStream"] = None
 
     def start(self) -> None:
+        if sd is None:
+            raise RuntimeError(
+                "sounddevice/PortAudio is not available in this environment; "
+                "microphone capture cannot be started."
+            )
         if self._thread and self._thread.is_alive():
             return
 
@@ -58,13 +70,18 @@ class MicrophoneListener:
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._stream is not None:
+        if self._stream is not None and sd is not None:
             self._stream.stop()
             self._stream.close()
         if self._thread:
             self._thread.join(timeout=1.0)
 
     def _run(self) -> None:
+        if sd is None:
+            raise RuntimeError(
+                "sounddevice/PortAudio is not available in this environment; "
+                "microphone capture cannot run."
+            )
         frames_per_chunk = int(self.sample_rate * self.chunk_duration)
         buffer = np.empty((0,), dtype=np.float32)
 

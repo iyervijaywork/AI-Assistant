@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import queue
+import re
 import sys
 import threading
 import uuid
@@ -25,7 +27,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSplitter,
-    QTextEdit,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -83,6 +85,7 @@ class ChatSession:
     partial_question: str = ""
     assistant_segments: List[str] = field(default_factory=list)
     assistant_display_segments: List[str] = field(default_factory=list)
+    assistant_display_html_segments: List[str] = field(default_factory=list)
     qa_pairs: List[QAPair] = field(default_factory=list)
     prep_notes: str = ""
     chatgpt_conversation_id: Optional[str] = None
@@ -107,6 +110,10 @@ class ChatSession:
     @property
     def assistant_text(self) -> str:
         return "\n\n".join(self.assistant_display_segments).strip()
+
+    @property
+    def assistant_html(self) -> str:
+        return "".join(self.assistant_display_html_segments).strip()
 
     @property
     def last_transcript_segment(self) -> str:
@@ -179,7 +186,9 @@ class TranscriptionWorker(QObject):
 
                 context: List[str] = []
                 if self.knowledge_base and not self.knowledge_base.is_empty():
-                    context = self.knowledge_base.top_matches(user_message)
+                    context = self.knowledge_base.top_matches(
+                        user_message, session_id=self.session_id
+                    )
 
                 self.status_changed.emit("Thinking…")
                 response = self.ai_client.chat_completion(self._conversation, context).strip()
@@ -383,22 +392,30 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.transcript_view = QTextEdit()
-        self.transcript_view.setAcceptRichText(False)
-        self.transcript_view.setReadOnly(True)
-        self.transcript_view.setPlaceholderText("Real-time transcription will appear here…")
+        self.transcript_view = QTextBrowser()
+        self.transcript_view.setOpenExternalLinks(True)
         self.transcript_view.setStyleSheet(
-            "font-size: 16px; padding: 12px; background: #fcfcfc; border-radius: 8px;"
+            "QTextBrowser {"
+            "  background: #f7f9fc;"
+            "  border: none;"
+            "  border-radius: 12px;"
+            "  padding: 12px;"
+            "  font-size: 15px;"
+            "  color: #1f2933;"
+            "}"
         )
 
-        self.assistant_view = QTextEdit()
-        self.assistant_view.setAcceptRichText(False)
-        self.assistant_view.setReadOnly(True)
-        self.assistant_view.setPlaceholderText(
-            "Assistant insights and responses will show here…"
-        )
+        self.assistant_view = QTextBrowser()
+        self.assistant_view.setOpenExternalLinks(True)
         self.assistant_view.setStyleSheet(
-            "font-size: 16px; padding: 12px; background: #f7fbff; border-radius: 8px;"
+            "QTextBrowser {"
+            "  background: #f8fbff;"
+            "  border: none;"
+            "  border-radius: 12px;"
+            "  padding: 12px;"
+            "  font-size: 15px;"
+            "  color: #1f2933;"
+            "}"
         )
 
         splitter.addWidget(self._wrap_with_label("Live Transcript", self.transcript_view))
@@ -454,7 +471,8 @@ class MainWindow(QMainWindow):
             "1. Headline Summary — one sentence that directly answers the question.\n"
             "2. Supporting Evidence — 2-4 bullet points with metrics, STAR stories, or examples.\n"
             "3. Improvement & Risks — candid reflections on gaps, trade-offs, or lessons.\n"
-            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer."
+            "4. Follow-up Suggestions — recommend clarifying questions or next steps for the interviewer.\n"
+            "Speak in the first person as the candidate, stay concise and confident, and avoid filler."
         )
 
         context_lines = profile.summary_lines()
@@ -739,8 +757,7 @@ class MainWindow(QMainWindow):
                 session.partial_question = cleaned
 
         if session_id == self.current_session_id:
-            self.transcript_view.setPlainText(session.transcript_text)
-            self._auto_scroll(self.transcript_view)
+            self._render_transcript_view(session)
 
     @pyqtSlot(str, str)
     def _register_user_message(self, session_id: str, message: str) -> None:
@@ -757,8 +774,7 @@ class MainWindow(QMainWindow):
         self._trim_session_history(session)
 
         if session_id == self.current_session_id:
-            self.transcript_view.setPlainText(session.transcript_text)
-            self._auto_scroll(self.transcript_view)
+            self._render_transcript_view(session)
 
     @pyqtSlot(str, str)
     def _append_assistant(self, session_id: str, text: str) -> None:
@@ -769,34 +785,311 @@ class MainWindow(QMainWindow):
         session.assistant_segments.append(text)
         session.conversation.append({"role": "assistant", "content": text})
 
+        cleaned = text.strip()
         if session.qa_pairs:
-            session.qa_pairs[-1].answer = text.strip()
-            formatted = self._format_structured_answer(
-                len(session.qa_pairs), session.qa_pairs[-1].question, text
-            )
-            session.assistant_display_segments.append(formatted)
+            session.qa_pairs[-1].answer = cleaned
+            response_index = len(session.qa_pairs)
+            question_text = session.qa_pairs[-1].question
         else:
-            session.assistant_display_segments.append(text.strip())
+            response_index = len(session.assistant_display_segments) + 1
+            question_text = "Assistant Response"
+
+        formatted_text, formatted_html = self._format_structured_answer_assets(
+            response_index, question_text, text
+        )
+        session.assistant_display_segments.append(formatted_text)
+        session.assistant_display_html_segments.append(formatted_html)
         self._trim_session_history(session)
 
         if session_id == self.current_session_id:
-            self.assistant_view.setPlainText(session.assistant_text)
-            self._auto_scroll(self.assistant_view)
+            self._render_assistant_view(session)
 
     @pyqtSlot(str)
     def _handle_worker_error(self, message: str) -> None:
         QMessageBox.critical(self, "Assistant Error", message)
 
-    def _auto_scroll(self, widget: QTextEdit) -> None:
+    def _auto_scroll(self, widget: QTextBrowser) -> None:
         widget.verticalScrollBar().setValue(widget.verticalScrollBar().maximum())
 
-    def _format_structured_answer(self, index: int, question: str, answer: str) -> str:
-        heading = f"Q{index}: {question.strip()}"
+    def _render_transcript_view(self, session: ChatSession) -> None:
+        self.transcript_view.setHtml(self._build_transcript_html(session))
+        self._auto_scroll(self.transcript_view)
+
+    def _render_assistant_view(self, session: ChatSession) -> None:
+        self.assistant_view.setHtml(self._build_assistant_html(session))
+        self._auto_scroll(self.assistant_view)
+
+    def _build_transcript_html(self, session: ChatSession) -> str:
+        cards: List[str] = [
+            self._transcript_card_html(index, question)
+            for index, question in enumerate(session.transcript_questions, start=1)
+            if question.strip()
+        ]
+        if session.partial_question.strip():
+            cards.append(
+                self._transcript_card_html(
+                    len(session.transcript_questions) + 1,
+                    session.partial_question,
+                    capturing=True,
+                )
+            )
+        if not cards:
+            cards.append(
+                self._placeholder_card_html(
+                    title="Waiting for the interviewer…",
+                    subtitle="Live questions will stream in as soon as we hear them through the microphone.",
+                    column_class="transcript",
+                )
+            )
+        return self._styled_html_document(cards, column_class="transcript")
+
+    def _build_assistant_html(self, session: ChatSession) -> str:
+        cards = list(session.assistant_display_html_segments)
+        if not cards:
+            cards.append(
+                self._placeholder_card_html(
+                    title="Your interview coach is ready.",
+                    subtitle=(
+                        "Structured answers, evidence, and follow-ups will appear here as soon as a"
+                        " full question has been captured."
+                    ),
+                    column_class="assistant",
+                )
+            )
+        return self._styled_html_document(cards, column_class="assistant")
+
+    def _transcript_card_html(self, index: int, question: str, capturing: bool = False) -> str:
+        clean_question = html.escape(question.strip()) if question.strip() else "Listening…"
+        capture_badge = (
+            "<span class='badge badge-capturing'>capturing</span>" if capturing else ""
+        )
+        card_class = "card transcript-card capturing" if capturing else "card transcript-card"
+        return (
+            f"<div class='{card_class}'>"
+            f"  <div class='card-title'>Question {index} {capture_badge}</div>"
+            f"  <div class='card-content'>{clean_question}</div>"
+            "</div>"
+        )
+
+    def _assistant_card_html(
+        self, index: int, question: str, sections: Dict[str, List[str]]
+    ) -> str:
+        safe_question = html.escape(question.strip()) if question.strip() else "Interview question"
+        headline_html = self._format_section_html(sections["headline"], bullet=False)
+        evidence_html = self._format_section_html(sections["evidence"], bullet=True)
+        risks_html = self._format_section_html(sections["risks"], bullet=True)
+        follow_html = self._format_section_html(sections["follow_up"], bullet=True)
+        return (
+            "<div class='card assistant-card'>"
+            f"  <div class='card-title'>Q{index} · {safe_question}</div>"
+            "  <div class='assistant-section'>"
+            "    <h4>Headline Summary</h4>"
+            f"    {headline_html}"
+            "  </div>"
+            "  <div class='assistant-section'>"
+            "    <h4>Supporting Evidence</h4>"
+            f"    {evidence_html}"
+            "  </div>"
+            "  <div class='assistant-section'>"
+            "    <h4>Improvement &amp; Risks</h4>"
+            f"    {risks_html}"
+            "  </div>"
+            "  <div class='assistant-section'>"
+            "    <h4>Follow-up Suggestions</h4>"
+            f"    {follow_html}"
+            "  </div>"
+            "</div>"
+        )
+
+    def _placeholder_card_html(self, title: str, subtitle: str, column_class: str) -> str:
+        safe_title = html.escape(title)
+        safe_subtitle = html.escape(subtitle)
+        return (
+            f"<div class='card placeholder-card {column_class}'>"
+            f"  <div class='card-title'>{safe_title}</div>"
+            f"  <div class='card-content muted'>{safe_subtitle}</div>"
+            "</div>"
+        )
+
+    def _styled_html_document(self, cards: List[str], column_class: str) -> str:
+        style = """
+        <style>
+            body {
+                margin: 0;
+                padding: 0;
+                background: transparent;
+                font-family: "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+                color: #1f2933;
+            }
+            .column {
+                display: flex;
+                flex-direction: column;
+                gap: 14px;
+            }
+            .card {
+                background: #ffffff;
+                border-radius: 14px;
+                padding: 16px 18px;
+                box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+            }
+            .transcript-card {
+                border-left: 4px solid #2563eb;
+            }
+            .transcript-card.capturing {
+                border-style: dashed;
+                border-color: #f59e0b;
+                background: #fff7ed;
+            }
+            .assistant-card {
+                border-left: 4px solid #0f766e;
+            }
+            .placeholder-card {
+                border: 2px dashed #cbd2d9;
+                background: #f9fafb;
+                color: #52606d;
+            }
+            .card-title {
+                font-size: 14px;
+                font-weight: 600;
+                letter-spacing: 0.02em;
+                margin-bottom: 8px;
+                text-transform: uppercase;
+                color: #334155;
+            }
+            .card-content {
+                font-size: 16px;
+                line-height: 1.5;
+            }
+            .card-content.muted {
+                color: #64748b;
+            }
+            .assistant-section {
+                margin-top: 12px;
+            }
+            .assistant-section h4 {
+                margin: 0 0 6px 0;
+                font-size: 15px;
+                font-weight: 600;
+                color: #0f172a;
+            }
+            .assistant-section ul {
+                margin: 0;
+                padding-left: 18px;
+            }
+            .assistant-section li {
+                margin-bottom: 4px;
+            }
+            .assistant-section p {
+                margin: 0;
+            }
+            .badge {
+                display: inline-block;
+                padding: 2px 8px;
+                margin-left: 8px;
+                border-radius: 999px;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                background: #e0f2fe;
+                color: #0369a1;
+            }
+            .badge-capturing {
+                background: #fef3c7;
+                color: #92400e;
+            }
+            .section-empty {
+                color: #94a3b8;
+                font-style: italic;
+            }
+        </style>
+        """
+        content = "".join(cards)
+        return (
+            "<html><head>"
+            f"{style}"
+            "</head><body>"
+            f"  <div class='column column-{column_class}'>"
+            f"    {content}"
+            "  </div>"
+            "</body></html>"
+        )
+
+    def _format_structured_answer_assets(
+        self, index: int, question: str, answer: str
+    ) -> tuple[str, str]:
+        sections = self._parse_structured_sections(answer)
+        heading = f"Q{index}: {question.strip()}" if question.strip() else f"Q{index}"
         divider = "-" * min(len(heading), 80)
-        body = answer.strip()
-        if not body:
-            return heading
-        return f"{heading}\n{divider}\n{body}"
+        lines: List[str] = [heading, divider, "Headline Summary:"]
+        lines.extend(self._format_section_lines(sections["headline"], bullet=False))
+        lines.append("")
+        lines.append("Supporting Evidence:")
+        lines.extend(self._format_section_lines(sections["evidence"], bullet=True))
+        lines.append("")
+        lines.append("Improvement & Risks:")
+        lines.extend(self._format_section_lines(sections["risks"], bullet=True))
+        lines.append("")
+        lines.append("Follow-up Suggestions:")
+        lines.extend(self._format_section_lines(sections["follow_up"], bullet=True))
+        text_answer = "\n".join(lines).strip()
+        html_answer = self._assistant_card_html(index, question, sections)
+        return text_answer, html_answer
+
+    def _parse_structured_sections(self, answer: str) -> Dict[str, List[str]]:
+        keys = {"headline": [], "evidence": [], "risks": [], "follow_up": []}
+        if not answer.strip():
+            return keys
+
+        section_aliases = {
+            "headline": ["headline summary", "summary", "answer"],
+            "evidence": ["supporting evidence", "evidence", "details", "support"],
+            "risks": ["improvement", "risks", "gaps", "lessons"],
+            "follow_up": ["follow-up", "follow up", "next steps", "followups"],
+        }
+
+        current_key = "headline"
+        for raw_line in answer.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            normalised = re.sub(r"[^a-z0-9]+", " ", line.lower()).strip()
+            matched_key = None
+            for key, aliases in section_aliases.items():
+                if any(normalised.startswith(alias) for alias in aliases):
+                    matched_key = key
+                    break
+            if matched_key:
+                current_key = matched_key
+                continue
+            keys.setdefault(current_key, []).append(line)
+
+        return keys
+
+    def _format_section_lines(self, lines: List[str], bullet: bool) -> List[str]:
+        cleaned = self._normalise_section_lines(lines)
+        if not cleaned:
+            return ["(not captured)"]
+        if bullet:
+            return [f"- {line}" for line in cleaned]
+        return cleaned
+
+    def _format_section_html(self, lines: List[str], bullet: bool) -> str:
+        cleaned = self._normalise_section_lines(lines)
+        if not cleaned:
+            return "<div class='section-empty'>(not captured)</div>"
+        if bullet:
+            items = "".join(f"<li>{html.escape(item)}</li>" for item in cleaned)
+            return f"<ul>{items}</ul>"
+        paragraphs = "".join(f"<p>{html.escape(item)}</p>" for item in cleaned)
+        return paragraphs or "<div class='section-empty'>(not captured)</div>"
+
+    def _normalise_section_lines(self, lines: List[str]) -> List[str]:
+        normalised: List[str] = []
+        for line in lines:
+            cleaned = re.sub(r"^[\-•\d\.\)\s]+", "", line).strip()
+            if cleaned:
+                normalised.append(cleaned)
+        return normalised
 
     def _ensure_client(self) -> AIClient:
         if not self.ai_client:
@@ -853,14 +1146,13 @@ class MainWindow(QMainWindow):
             )
 
     def _render_session(self, session: ChatSession) -> None:
-        self.transcript_view.setPlainText(session.transcript_text)
-        self._auto_scroll(self.transcript_view)
-        self.assistant_view.setPlainText(session.assistant_text)
-        self._auto_scroll(self.assistant_view)
+        self._render_transcript_view(session)
+        self._render_assistant_view(session)
         if session.prep_notes:
             self.prep_summary_label.setText(session.prep_notes)
         else:
             self._update_prep_summary_label()
+        self._update_kb_status(session.session_id)
 
     def _trim_session_history(self, session: ChatSession, max_turns: int = 20) -> None:
         if len(session.conversation) <= 1:
@@ -888,8 +1180,13 @@ class MainWindow(QMainWindow):
         if not file_paths or not self.knowledge_base:
             return
 
+        session = self.sessions.get(self.current_session_id) if self.current_session_id else None
+        session_id = session.session_id if session else None
+
         try:
-            added_chunks = self.knowledge_base.ingest_files(Path(path) for path in file_paths)
+            added_chunks = self.knowledge_base.ingest_files(
+                (Path(path) for path in file_paths), session_id=session_id
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Import error", str(exc))
             return
@@ -902,26 +1199,36 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._update_kb_status()
+        self._update_kb_status(session_id)
+        scope_message = (
+            "for this interview session."
+            if session_id
+            else "available to every session."
+        )
         QMessageBox.information(
             self,
             "Knowledge base updated",
-            f"Loaded {added_chunks} reference snippets from {len(file_paths)} files.",
+            (
+                "Loaded {chunks} reference snippets from {files} files "
+                f"{scope_message}"
+            ).format(chunks=added_chunks, files=len(file_paths)),
         )
 
-    def _update_kb_status(self) -> None:
+    def _update_kb_status(self, session_id: Optional[str] = None) -> None:
         if not self.knowledge_base or self.knowledge_base.is_empty():
             self.kb_status_label.setText("Knowledge base: empty")
             self.kb_status_label.setToolTip("")
             return
 
-        sources = self.knowledge_base.listed_sources()
+        sources = self.knowledge_base.listed_sources(session_id=session_id)
         if not sources:
             self.kb_status_label.setText("Knowledge base: ready")
             self.kb_status_label.setToolTip("")
             return
 
-        self.kb_status_label.setText(f"Knowledge base: {len(sources)} files")
+        self.kb_status_label.setText(
+            f"Knowledge base: {len(sources)} files for this session"
+        )
         self.kb_status_label.setToolTip("\n".join(sources))
 
     def closeEvent(self, event) -> None:  # type: ignore[override]

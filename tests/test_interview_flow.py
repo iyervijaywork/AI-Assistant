@@ -1,0 +1,67 @@
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("OPENAI_API_KEY", "test-key")
+
+try:
+    from PyQt6 import QtWidgets
+except ImportError as exc:  # pragma: no cover - skip if Qt dependencies missing
+    import pytest
+
+    pytest.skip(f"PyQt6 unavailable: {exc}", allow_module_level=True)
+
+QApplication = QtWidgets.QApplication
+
+try:
+    from src.main import MainWindow
+except Exception as exc:  # pragma: no cover - skip if GUI deps missing
+    import pytest
+
+    pytest.skip(f"MainWindow unavailable: {exc}", allow_module_level=True)
+
+
+def _get_app():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+def test_transcript_and_response_flow():
+    app = _get_app()
+    window = MainWindow()
+
+    # Allow any deferred setup to run
+    app.processEvents()
+
+    assert window.current_session_id is not None
+    session_id = window.current_session_id
+    session = window.sessions[session_id]
+
+    transcript_fragment = "Tell me about a time you led a team"
+    window._append_transcript(session_id, transcript_fragment)
+    assert transcript_fragment.lower() in window.transcript_view.toHtml().lower()
+
+    question = "Tell me about a time you led a team to deliver under pressure."
+    window._register_user_message(session_id, question)
+    assert session.transcript_questions[-1] == question
+    assert session.qa_pairs[-1].question == question
+
+    answer = (
+        "Headline Summary: I led our data migration under a four-week deadline.\n"
+        "Supporting Evidence:\n"
+        "- I created a war room with engineering, QA, and analytics to unblock issues daily.\n"
+        "- I negotiated phased rollouts with the business to keep customer impact at zero.\n"
+        "Improvement & Risks:\n"
+        "- I would automate more validation to catch regressions faster next time.\n"
+        "Follow-up Suggestions:\n"
+        "- I can share how we tracked morale and burn-down metrics in detail."
+    )
+    window._append_assistant(session_id, answer)
+
+    assert session.qa_pairs[-1].answer.startswith("Headline Summary")
+    assert "Q1" in session.assistant_html
+    assert "I led" in session.assistant_segments[-1]
+    assert "war room" in window.assistant_view.toHtml().lower()
+
+    window.close()
